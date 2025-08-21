@@ -46,6 +46,9 @@ import (
 	readline "github.com/chzyer/readline"
 	mpb "github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
+
+	// XXH3（非加密哈希）用于端到端完整性校验（带 seed）
+	xxh3 "github.com/zeebo/xxh3"
 )
 
 // ---------- 常量与协议 ----------
@@ -342,8 +345,12 @@ const (
 	frameChunk    = byte(0x05)
 	frameFileDone = byte(0x06)
 	frameXferDone = byte(0x07)
-	frameError    = byte(0x7F)
-	chunkSize     = 1 << 20 // 1MiB
+	// 新增：单文件校验结果
+	frameFileAck  = byte(0x08)
+	frameFileNack = byte(0x09)
+
+	frameError = byte(0x7F)
+	chunkSize  = 1 << 20 // 1MiB
 )
 
 type xferOffer struct {
@@ -393,7 +400,8 @@ func newTotalBar(p *mpb.Progress, total int64) *mpb.Bar {
 	)
 }
 
-func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string, ui *uiConsole) error {
+// sendXfer 现在接受 seed：用于 XXH3-128 带种子校验
+func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string, ui *uiConsole, seed uint64) error {
 	xs, err := h.NewStream(ctx, remote, protoXfer)
 	if err != nil {
 		return err
@@ -451,9 +459,7 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 	if (off.Kind == "file" && off.Size > 0) || (off.Kind == "dir" && off.Size > 0) {
 		p = mpb.New(
 			mpb.WithWidth(64),
-			// FIX: 稍微快一点的刷新，短传输更容易看到速度
 			mpb.WithRefreshRate(120*time.Millisecond),
-			// ✅ 渲染到 stderr，避免和 readline 冲突
 			mpb.WithOutput(os.Stderr),
 		)
 		if off.Kind == "file" && off.Size > 0 {
@@ -467,8 +473,8 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 
 	createdBar := func() bool { return fileBar != nil || totalBar != nil }
 
-	// 发送单个文件（并驱动进度条）
-	sendOneFile := func(name string, r io.Reader, size int64) error {
+	// 发送单个文件（计算/携带 XXH3-128-seed + 等待接收端 ACK/NACK，并驱动进度条）
+	sendOneAttempt := func(name string, r io.Reader, size int64, expectHash string) error {
 		// 目录模式：切换“当前文件”条
 		if p != nil && totalBar != nil {
 			if fileBar != nil {
@@ -477,7 +483,6 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 			}
 			if size > 0 {
 				fileBar = newFileBar(p, name, size)
-				// FIX: 调整起始时间，Average/EWMA 装饰器都受益
 				fileBar.DecoratorAverageAdjust(time.Now())
 			} else {
 				fileBar = nil
@@ -490,13 +495,20 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 			totalBar.DecoratorAverageAdjust(time.Now())
 		}
 
-		hdr := map[string]any{"name": name, "size": size}
+		hdr := map[string]any{
+			"name": name,
+			"size": size,
+			"algo": "xxh3-128-seed",
+			"hash": expectHash,
+		}
 		b, _ := json.Marshal(hdr)
 		if err := writeFrame(xs, frameFileHdr, b); err != nil {
 			return err
 		}
+
 		buf := make([]byte, chunkSize)
 		var sent int64
+		hw := xxh3.NewSeed(seed) // 防御性：边发边自校验发送侧数据流（与 expectHash 对比）
 		for {
 			if size >= 0 && sent >= size {
 				break
@@ -505,10 +517,10 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 			n, er := r.Read(buf)
 			if n > 0 {
 				sent += int64(n)
+				_, _ = hw.Write(buf[:n])
 				if err := writeFrame(xs, frameChunk, buf[:n]); err != nil {
 					return err
 				}
-				// FIX: 使用 EWMA 计时更新，驱动 EwmaSpeed/EwmaETA
 				if fileBar != nil {
 					fileBar.EwmaIncrBy(n, time.Since(start))
 				}
@@ -529,19 +541,94 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 		if fileBar != nil {
 			fileBar.SetTotal(size, true)
 		}
-		return nil
-	}
 
-	switch off.Kind {
-	case "text":
-		_ = sendOneFile(off.Name, strings.NewReader(arg), off.Size)
-	case "file":
-		f, err := os.Open(arg)
+		// 等待接收端反馈：ACK / NACK
+		typ, _, err := readFrame(xs)
 		if err != nil {
 			return err
 		}
+		switch typ {
+		case frameFileAck:
+			// 可选：对比发送侧流式计算是否与 expectHash 一致（调试/防御）
+			// 修正 #1: 将不可寻址的返回值先赋给变量
+			sumBytes := hw.Sum128().Bytes()
+			got := fmt.Sprintf("%x", sumBytes[:])
+			if expectHash != "" && got != expectHash {
+				return fmt.Errorf("sender self-check mismatched (unexpected)")
+			}
+			return nil
+		case frameFileNack:
+			return fmt.Errorf("receiver reported hash mismatch")
+		default:
+			return fmt.Errorf("unexpected response after file: 0x%02x", typ)
+		}
+	}
+
+	// 预计算 XXH3-128（带 seed）
+	hashFile := func(path string) (string, int64, error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return "", 0, err
+		}
 		defer f.Close()
-		_ = sendOneFile(off.Name, f, off.Size)
+		st, err := f.Stat()
+		if err != nil {
+			return "", 0, err
+		}
+		h := xxh3.NewSeed(seed)
+		if _, err := io.Copy(h, f); err != nil {
+			return "", 0, err
+		}
+		sum := h.Sum128().Bytes()
+		return fmt.Sprintf("%x", sum[:]), st.Size(), nil
+	}
+
+	failedFiles := make([]string, 0)
+	const maxRetries = 3 // 收到 NACK 后重传次数
+
+	switch off.Kind {
+	case "text":
+		hv := fmt.Sprintf("%x", xxh3.HashString128Seed(arg, seed).Bytes())
+		attempt := 0
+		for {
+			err := sendOneAttempt(off.Name, strings.NewReader(arg), off.Size, hv)
+			if err == nil || attempt >= maxRetries {
+				if err != nil {
+					failedFiles = append(failedFiles, off.Name)
+				}
+				break
+			}
+			attempt++
+			ui.println(fmt.Sprintf("hash mismatch, retrying text (%d/%d)…", attempt, maxRetries))
+			// 轻微退避
+			time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
+		}
+	case "file":
+		hv, sz, err := hashFile(arg)
+		if err != nil {
+			return err
+		}
+		if off.Size <= 0 {
+			off.Size = sz
+		}
+		attempt := 0
+		for {
+			f, er := os.Open(arg)
+			if er != nil {
+				return er
+			}
+			err = sendOneAttempt(off.Name, f, off.Size, hv)
+			_ = f.Close()
+			if err == nil || attempt >= maxRetries {
+				if err != nil {
+					failedFiles = append(failedFiles, off.Name)
+				}
+				break
+			}
+			attempt++
+			ui.println(fmt.Sprintf("hash mismatch, retrying %s (%d/%d)…", off.Name, attempt, maxRetries))
+			time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
+		}
 	case "dir":
 		root := arg
 		filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -553,12 +640,28 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 			if er != nil || !st.Mode().IsRegular() {
 				return nil
 			}
-			f, er := os.Open(path)
+			hv, _, er := hashFile(path)
 			if er != nil {
 				return nil
 			}
-			defer f.Close()
-			_ = sendOneFile(rel, f, st.Size())
+			attempt := 0
+			for {
+				f, er2 := os.Open(path)
+				if er2 != nil {
+					return nil
+				}
+				e := sendOneAttempt(rel, f, st.Size(), hv)
+				_ = f.Close()
+				if e == nil || attempt >= maxRetries {
+					if e != nil {
+						failedFiles = append(failedFiles, rel)
+					}
+					break
+				}
+				attempt++
+				ui.println(fmt.Sprintf("hash mismatch, retrying %s (%d/%d)…", rel, attempt, maxRetries))
+				time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
+			}
 			return nil
 		})
 		if totalBar != nil {
@@ -575,6 +678,12 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 		ui.rl.Refresh()
 	}
 	_ = xs.CloseWrite()
+	if len(failedFiles) > 0 {
+		ui.println("some files failed integrity check and were not delivered:")
+		for _, f := range failedFiles {
+			ui.println("  - " + f)
+		}
+	}
 	return nil
 }
 
@@ -592,7 +701,8 @@ func tryDequeuePrompt(ch chan *promptReq) *promptReq {
 	}
 }
 
-func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, outDir string, askYesNo func(q string, timeout time.Duration) bool, ui *uiConsole) {
+// handleIncomingXfer 现在也接受 seed：用于 XXH3-128 带种子校验
+func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, outDir string, askYesNo func(q string, timeout time.Duration) bool, ui *uiConsole, seed uint64) {
 	defer xs.Close()
 	typ, payload, err := readFrame(xs)
 	if err != nil || typ != frameOffer {
@@ -621,6 +731,12 @@ func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, out
 
 	var fw *os.File
 	var dstPath string
+	var expectHash string
+	var algo string
+	failedFiles := make([]string, 0)
+	// 修正 #2: 避免与函数参数 h 冲突，重命名为 hasher
+	hasher := xxh3.NewSeed(seed)
+
 	for {
 		typ, payload, err = readFrame(xs)
 		if err != nil {
@@ -631,6 +747,8 @@ func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, out
 			var hdr struct {
 				Name string `json:"name"`
 				Size int64  `json:"size"`
+				Algo string `json:"algo"`
+				Hash string `json:"hash"`
 			}
 			_ = json.Unmarshal(payload, &hdr)
 			dstPath = filepath.Join(outDir, hdr.Name)
@@ -640,17 +758,40 @@ func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, out
 				_ = writeFrame(xs, frameError, []byte(err.Error()))
 				return
 			}
+			expectHash = strings.ToLower(strings.TrimSpace(hdr.Hash))
+			algo = strings.ToLower(strings.TrimSpace(hdr.Algo))
+			// 修正 #3: 使用新的变量名 hasher
+			hasher.Reset()
 		case frameChunk:
 			if fw != nil {
 				_, _ = fw.Write(payload)
+				// 修正 #4: 使用新的变量名 hasher
+				_, _ = hasher.Write(payload)
 			}
 		case frameFileDone:
 			if fw != nil {
 				_ = fw.Close()
 				fw = nil
-				ui.println("← received: " + dstPath)
+				// 修正 #5: 使用新的变量名 hasher，并修复不可寻址值切片问题
+				sumBytes := hasher.Sum128().Bytes()
+				got := fmt.Sprintf("%x", sumBytes[:])
+				if algo != "xxh3-128-seed" || (expectHash != "" && got != expectHash) {
+					_ = os.Remove(dstPath)
+					_ = writeFrame(xs, frameFileNack, nil)
+					failedFiles = append(failedFiles, dstPath)
+					ui.println("✗ hash mismatch, removed: " + dstPath)
+				} else {
+					_ = writeFrame(xs, frameFileAck, nil)
+					ui.println("← received: " + dstPath)
+				}
 			}
 		case frameXferDone:
+			if len(failedFiles) > 0 {
+				ui.println("warning: integrity check failed for the following files (removed):")
+				for _, f := range failedFiles {
+					ui.println("  - " + f)
+				}
+			}
 			return
 		case frameError:
 			ui.println("← xfer error: " + string(payload))
@@ -925,9 +1066,9 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 		_ = s.Close()
 		return
 	}
-	// FIX: 不使用 defer ui.Close()，避免 Close() 阻塞退出；改为需要时异步关闭
 
 	handshakeSuccess := false
+	var xferSeed uint64 // XXH3 的 64-bit 种子
 	defer func() {
 		// 统一的握手失败回收：若未成功，则 fail+consume
 		if !handshakeSuccess {
@@ -941,7 +1082,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 		if err != nil || !strings.HasPrefix(line, chatHello) {
 			ui.logln("handshake failed: did not receive valid HELLO in time")
 			_ = s.Close()
-			go ui.Close() // FIX: 异步关闭
+			go ui.Close()
 			return
 		}
 		K, err := runPAKEAndConfirm(ctx, s, false, passphrase, nameplate, protoChat, h.ID(), remote)
@@ -951,6 +1092,9 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 			go ui.Close()
 			return
 		}
+		// 从 K 推导 XFER 用 seed（用 protoXfer 的 transcript）
+		xferSeed = binary.LittleEndian.Uint64(hkdfBytes(K, "xfer-xxh3-seed", buildTranscript(nameplate, protoXfer, h.ID(), remote), 8))
+
 		sas := sasFromKey(K, buildTranscript(nameplate, protoChat, h.ID(), remote))
 		ui.logf("Remote PeerID: %s | SAS: %s", remote.String(), sas)
 		prompt := fmt.Sprintf("[%s] Confirm peer within 30s [y/N]: ", ts())
@@ -1007,6 +1151,9 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 			go ui.Close()
 			return
 		}
+		// 从 K 推导 XFER 用 seed（用 protoXfer 的 transcript）
+		xferSeed = binary.LittleEndian.Uint64(hkdfBytes(K, "xfer-xxh3-seed", buildTranscript(nameplate, protoXfer, h.ID(), remote), 8))
+
 		sas := sasFromKey(K, buildTranscript(nameplate, protoChat, h.ID(), remote))
 		ui.logf("Waiting for peer confirmation… | SAS: %s | remote=%s", sas, remote)
 
@@ -1066,7 +1213,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 		ui.println(fmt.Sprintf("path: DIRECT (%s)", pi.Transport))
 	}
 
-	// 安装 XFER handler + 提示通道
+	// 安装 XFER handler + 提示通道（闭包捕获 xferSeed）
 	promptCh := make(chan *promptReq, 4)
 	askYesNo := func(q string, timeout time.Duration) bool {
 		pr := &promptReq{question: q, resp: make(chan bool, 1)}
@@ -1081,7 +1228,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 		}
 	}
 	h.SetStreamHandler(protoXfer, func(xs network.Stream) {
-		go handleIncomingXfer(ctx, h, xs, outDir, askYesNo, ui)
+		go handleIncomingXfer(ctx, h, xs, outDir, askYesNo, ui, xferSeed)
 	})
 	defer h.RemoveStreamHandler(protoXfer)
 
@@ -1097,7 +1244,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 	notifiee := &network.NotifyBundle{
 		DisconnectedF: func(_ network.Network, c network.Conn) {
 			if c == thisConn {
-				go ui.Close() // FIX: 异步关闭，避免阻塞
+				go ui.Close()
 				once.Do(func() {
 					reasonCh <- "peer disconnected"
 					close(done)
@@ -1115,7 +1262,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 			txt := r.Text()
 			if strings.HasPrefix(txt, chatBye) {
 				once.Do(func() {
-					go ui.Close() // FIX: 异步关闭
+					go ui.Close()
 					reasonCh <- "peer closed the chat"
 					close(done)
 				})
@@ -1127,7 +1274,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 			ui.println("← " + txt)
 		}
 		once.Do(func() {
-			go ui.Close() // ✅ 对端读流结束也要关 UI，否则要按回车
+			go ui.Close()
 			reasonCh <- "peer closed the stream"
 			close(done)
 		})
@@ -1146,8 +1293,8 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 					reasonCh <- "you closed the chat"
 					close(done)
 				})
-				_ = s.CloseRead()  // 先打断本地读
-				_ = s.CloseWrite() // 再半关写
+				_ = s.CloseRead()
+				_ = s.CloseWrite()
 				go ui.Close()
 				return true
 			case strings.HasPrefix(cmd, "/send "):
@@ -1193,7 +1340,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 					return true
 				}
 				ui.println("sending...")
-				if err := sendXfer(ctx, h, thisConn.RemotePeer(), kind, arg, ui); err != nil {
+				if err := sendXfer(ctx, h, thisConn.RemotePeer(), kind, arg, ui, xferSeed); err != nil {
 					ui.println("send failed: " + err.Error())
 				} else {
 					ui.println("xfer done.")
@@ -1206,9 +1353,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 		for {
 			txt, err := ui.rl.Readline()
 			if err != nil {
-				// 关键点：第一次 Ctrl+C 不会触发 SIGINT，而是 ErrInterrupt
 				if errors.Is(err, readline.ErrInterrupt) {
-					// 当作本地 /bye：告诉对端，随后打断读并关 UI
 					fmt.Fprintln(w, chatBye)
 					_ = w.Flush()
 					once.Do(func() {
@@ -1221,7 +1366,6 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 					return
 				}
 				if errors.Is(err, io.EOF) {
-					// Ctrl+D 空行 / stdin 关闭：也直接收尾
 					once.Do(func() {
 						reasonCh <- "stdin closed"
 						close(done)
@@ -1231,7 +1375,6 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 					go ui.Close()
 					return
 				}
-				// 其它错误：保守处理为立即收尾
 				once.Do(func() {
 					reasonCh <- "readline error"
 					close(done)
@@ -1242,7 +1385,6 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 				return
 			}
 			line := strings.TrimRight(txt, "\r\n")
-			// 若有挂起的 yes/no 提示，本次输入用于回答
 			if pending := tryDequeuePrompt(promptCh); pending != nil {
 				al := strings.ToLower(strings.TrimSpace(line))
 				pending.resp <- (al == "y" || al == "yes")
@@ -1266,6 +1408,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 
 	reason := <-reasonCh
 	ui.println(reason)
+
 	// 确保两侧都被打断并收尾
 	_ = s.CloseRead()
 	_ = s.CloseWrite()
@@ -1471,6 +1614,7 @@ func tryOpenChat(ctx context.Context, h host.Host, rzvc rzv.RendezvousClient, to
 			preferRelay := relayFirst || allRelayedAddrs(remote) || len(remoteRelays) > 0
 
 			var s network.Stream
+			var err error
 			if preferRelay {
 				if s, err = dialViaRelay(remote, remoteRelays); err == nil {
 					return s, nil
