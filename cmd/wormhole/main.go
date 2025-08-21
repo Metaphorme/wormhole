@@ -42,16 +42,15 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 	rzv "github.com/waku-org/go-libp2p-rendezvous"
 
-	// 统一交互 UI 与进度条
 	readline "github.com/chzyer/readline"
 	mpb "github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
 
-	// XXH3（非加密哈希）用于端到端完整性校验（带 seed）
 	xxh3 "github.com/zeebo/xxh3"
 )
 
-// ---------- 常量与协议 ----------
+// ---------- 聊天协议控制令牌 ----------
+// 这些常量用于在聊天流中发送控制信号，例如建立连接、接受/拒绝验证和断开连接。
 const (
 	chatHello  = "##HELLO"
 	chatAccept = "##ACCEPT"
@@ -59,6 +58,7 @@ const (
 	chatBye    = "##BYE"
 )
 
+// 定义了聊天和文件传输的 libp2p 协议 ID
 var (
 	protoChat = protocol.ID("/wormhole/1.0.0/chat")
 	protoXfer = protocol.ID("/wormhole/1.0.0/xfer")
@@ -67,7 +67,53 @@ var (
 //go:embed eff_short_wordlist_2_0.txt
 var effShortWordlist []byte
 
-// ---------- 控制面（与 server 协议保持一致） ----------
+// ---------- ANSI 颜色代码 (遵循 NO_COLOR 环境变量) ----------
+var colorEnabled = os.Getenv("NO_COLOR") == ""
+
+// c 是一个辅助函数，用于给字符串添加 ANSI 颜色代码。
+func c(s, code string) string {
+	if !colorEnabled {
+		return s
+	}
+	return code + s + "\x1b[0m"
+}
+
+const (
+	cBold = "\x1b[1m"
+	cDim  = "\x1b[2m"
+	cCyan = "\x1b[36m"
+	cYel  = "\x1b[33m"
+)
+
+// printPeerVerifyCard 打印对等节点验证信息卡片，包含其ID和短认证字符串(SAS)。
+func printPeerVerifyCard(ui *uiConsole, remote peer.ID, sas string) {
+	ui.println(c("┌─ Peer Verification ───────────────────────────────────────┐", cBold))
+	ui.println("  ID  : " + c(remote.String(), cCyan))
+	ui.println("  SAS : " + c(sas, cYel+cBold))
+	ui.println(c("└───────────────────────────────────────────────────────────┘", cBold))
+}
+
+// printConnCard 打印连接摘要卡片，显示连接路径、本地和远程地址等信息。
+func printConnCard(ui *uiConsole, pi pathInfo, local, remote ma.Multiaddr) {
+	pathLine := ""
+	if pi.Kind == "RELAY" {
+		pathLine = fmt.Sprintf("RELAY via %s (%s)", pi.RelayID, pi.Transport)
+	} else {
+		pathLine = fmt.Sprintf("DIRECT (%s)", pi.Transport)
+	}
+	ui.println(c("┌─ Connection Summary ──────────────────────────────┐", cBold))
+	ui.println("  path   : " + c(pathLine, cCyan))
+	ui.println("  local  : " + local.String())
+	ui.println("  remote : " + remote.String())
+	if pi.Kind == "RELAY" && verbose {
+		ui.println("  via    : " + pi.RelayVia)
+	}
+	ui.println(c("└───────────────────────────────────────────────────┘", cBold))
+}
+
+// ---------- 控制平面 API 数据结构 ----------
+// 这些结构体用于与控制服务器进行JSON API通信，以分配、声明或消费一个"虫洞"代码。
+
 type addrBundle struct {
 	Namespace string   `json:"namespace"`
 	Addrs     []string `json:"addrs"`
@@ -99,8 +145,9 @@ type failRequest struct {
 	Nameplate string `json:"nameplate"`
 }
 
-// ---------- 小工具 ----------
-var verbose bool // 全局：是否打印详尽日志
+// ---------- 工具函数 ----------
+
+var verbose bool // 全局标志，用于控制是否输出详细日志
 
 func min64(a, b int64) int64 {
 	if a < b {
@@ -108,13 +155,9 @@ func min64(a, b int64) int64 {
 	}
 	return b
 }
+func ts() string { return time.Now().Format("2006-01-02 15:04:05") }
 
-func ts() string {
-	// 握手、询问等关键提示加时间戳
-	return time.Now().Format("2006-01-02 15:04:05")
-}
-
-// 统一 UI：使用 readline，解决提示符被打断问题，且支持 ←/→ 前缀
+// uiConsole 是一个对 readline 库的封装，提供了线程安全的控制台 I/O 操作。
 type uiConsole struct {
 	rl            *readline.Instance
 	mu            sync.Mutex
@@ -128,7 +171,7 @@ func newUI(prompt string) (*uiConsole, error) {
 	}
 	return &uiConsole{rl: rl, defaultPrompt: prompt}, nil
 }
-func (ui *uiConsole) Close() { _ = ui.rl.Close() } // 注意：有时会阻塞到下一次按键
+func (ui *uiConsole) Close() { _ = ui.rl.Close() }
 
 func (ui *uiConsole) setPrompt(p string) {
 	ui.mu.Lock()
@@ -138,21 +181,16 @@ func (ui *uiConsole) setPrompt(p string) {
 }
 func (ui *uiConsole) resetPrompt() { ui.setPrompt(ui.defaultPrompt) }
 
+// println 在刷新 readline 提示的同时打印一行消息，避免覆盖用户输入。
 func (ui *uiConsole) println(msg string) {
 	ui.mu.Lock()
 	defer ui.mu.Unlock()
 	_, _ = ui.rl.Stdout().Write([]byte("\r" + msg + "\n"))
 	ui.rl.Refresh()
 }
-func (ui *uiConsole) printf(format string, a ...any) {
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
-	_, _ = ui.rl.Stdout().Write([]byte("\r" + fmt.Sprintf(format, a...)))
-	ui.rl.Refresh()
-}
-func (ui *uiConsole) logln(msg string) { ui.println(ts() + " " + msg) }
+func (ui *uiConsole) logln(msg string) { ui.println(c(ts(), cDim) + " " + msg) }
 func (ui *uiConsole) logf(format string, a ...any) {
-	ui.println(ts() + " " + fmt.Sprintf(format, a...))
+	ui.println(c(ts(), cDim) + " " + fmt.Sprintf(format, a...))
 }
 func (ui *uiConsole) promptQuestion(q string) { ui.setPrompt(q) }
 func (ui *uiConsole) promptQuestionAndRestore(q string) func() {
@@ -160,7 +198,7 @@ func (ui *uiConsole) promptQuestionAndRestore(q string) func() {
 	return func() { ui.resetPrompt() }
 }
 
-// EFF wordlist 2.0（行形如 "11111<TAB>word"）
+// effWords 从嵌入的文本文件中解析 EFF 短词列表。
 func effWords() []string {
 	lines := strings.Split(string(effShortWordlist), "\n")
 	words := make([]string, 0, len(lines))
@@ -176,6 +214,8 @@ func effWords() []string {
 	}
 	return words
 }
+
+// randWord 从给定的单词列表中随机选择一个单词。
 func randWord(ws []string) string {
 	if len(ws) == 0 {
 		return "word"
@@ -184,6 +224,7 @@ func randWord(ws []string) string {
 	return ws[nBig.Int64()]
 }
 
+// isUnspecified 检查一个 multiaddr 是否是未指定地址 (如 0.0.0.0 或 ::)。
 func isUnspecified(a ma.Multiaddr) bool {
 	if v4, _ := a.ValueForProtocol(ma.P_IP4); v4 != "" {
 		return v4 == "0.0.0.0"
@@ -193,6 +234,8 @@ func isUnspecified(a ma.Multiaddr) bool {
 	}
 	return false
 }
+
+// isLoopbackOrPrivate 检查一个 multiaddr 是否是环回或私有地址。
 func isLoopbackOrPrivate(a ma.Multiaddr) bool {
 	if v4, _ := a.ValueForProtocol(ma.P_IP4); v4 != "" {
 		ip := net.ParseIP(v4)
@@ -211,7 +254,7 @@ func isLoopbackOrPrivate(a ma.Multiaddr) bool {
 	return false
 }
 
-// HTTP JSON（带指数退避）
+// httpPostJSON 发送一个带指数退避重试的 HTTP POST 请求。
 func httpPostJSON[T any](ctx context.Context, base, path string, body any, out *T) error {
 	u := strings.TrimRight(base, "/") + path
 	const maxAttempts = 5
@@ -272,6 +315,7 @@ func httpPostJSON[T any](ctx context.Context, base, path string, body any, out *
 	return context.DeadlineExceeded
 }
 
+// parseP2pAddrInfos 解析字符串形式的 multiaddr 列表，并转换为 peer.AddrInfo 结构，同时按 PeerID 去重。
 func parseP2pAddrInfos(addrs []string) ([]peer.AddrInfo, error) {
 	seen := make(map[peer.ID]bool)
 	var out []peer.AddrInfo
@@ -303,7 +347,11 @@ func parseP2pAddrInfos(addrs []string) ([]peer.AddrInfo, error) {
 	return out, nil
 }
 
-// ---------- 帧编解码（给 XFER 与 PAKE 子握手用） ----------
+// ---------- 帧 I/O ----------
+// 定义了一个简单的帧协议: [1字节类型 | 8字节长度 | 载荷]。
+// 这用于在同一个流上传输不同类型的消息。
+
+// writeFrame 将一个带类型的载荷写入 io.Writer。
 func writeFrame(w io.Writer, typ byte, payload []byte) error {
 	var hdr [9]byte
 	hdr[0] = typ
@@ -317,6 +365,8 @@ func writeFrame(w io.Writer, typ byte, payload []byte) error {
 	}
 	return nil
 }
+
+// readFrame 从 io.Reader 读取一个帧。
 func readFrame(r io.Reader) (byte, []byte, error) {
 	var hdr [9]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -336,36 +386,39 @@ func readFrame(r io.Reader) (byte, []byte, error) {
 	return typ, buf, nil
 }
 
-// ---------- XFER（简化可靠实现） ----------
+// ---------- 文件传输 (XFER) 协议 ----------
 const (
-	frameOffer    = byte(0x01)
-	frameAccept   = byte(0x02)
-	frameReject   = byte(0x03)
-	frameFileHdr  = byte(0x04)
-	frameChunk    = byte(0x05)
-	frameFileDone = byte(0x06)
-	frameXferDone = byte(0x07)
-	// 新增：单文件校验结果
-	frameFileAck  = byte(0x08)
-	frameFileNack = byte(0x09)
+	// 文件传输协议的帧类型定义
+	frameOffer    = byte(0x01) // 发送方 -> 接收方: 发送一个传输提议
+	frameAccept   = byte(0x02) // 接收方 -> 发送方: 接受提议
+	frameReject   = byte(0x03) // 接收方 -> 发送方: 拒绝提议
+	frameFileHdr  = byte(0x04) // 发送方 -> 接收方: 单个文件的元数据 (名称, 大小, 哈希)
+	frameChunk    = byte(0x05) // 发送方 -> 接收方: 文件数据块
+	frameFileDone = byte(0x06) // 发送方 -> 接收方: 单个文件传输完成
+	frameXferDone = byte(0x07) // 发送方 -> 接收方: 所有文件传输完成
+	frameFileAck  = byte(0x08) // 接收方 -> 发送方: 文件哈希校验成功
+	frameFileNack = byte(0x09) // 接收方 -> 发送方: 文件哈希校验失败
 
-	frameError = byte(0x7F)
-	chunkSize  = 1 << 20 // 1MiB
+	frameError = byte(0x7F) // 任一方: 发生错误
+	chunkSize  = 1 << 20    // 1MiB, 文件分块大小
 )
 
+// xferOffer 定义了文件传输提议的内容。
 type xferOffer struct {
-	Kind  string `json:"kind"`           // text|file|dir
-	Name  string `json:"name,omitempty"` // file/dir 名或虚拟名
-	Size  int64  `json:"size,omitempty"` // text/file 总字节
-	Files int    `json:"files,omitempty"`
+	Kind  string `json:"kind"`            // 类型: "file" 或 "dir"
+	Name  string `json:"name,omitempty"`  // 文件或目录名
+	Size  int64  `json:"size,omitempty"`  // 总字节数
+	Files int    `json:"files,omitempty"` // 文件数量 (仅目录)
 }
 
 // ---------- 进度条 ----------
+
+// newFileBar 为单个文件传输创建一个新的进度条。
 func newFileBar(p *mpb.Progress, name string, total int64) *mpb.Bar {
 	return p.New(total,
 		mpb.BarStyle(),
-		mpb.BarPriority(0),        // 置顶：当前文件
-		mpb.BarRemoveOnComplete(), // 完成后移除
+		mpb.BarPriority(0),
+		mpb.BarRemoveOnComplete(),
 		mpb.PrependDecorators(
 			decor.Name(name+" ", decor.WC{C: decor.DindentRight}),
 			decor.CountersKibiByte("% .1f / % .1f"),
@@ -373,7 +426,6 @@ func newFileBar(p *mpb.Progress, name string, total int64) *mpb.Bar {
 		mpb.AppendDecorators(
 			decor.Percentage(),
 			decor.Name(" | "),
-			// FIX: 用 EWMA 速度，短文件也能稳定显示
 			decor.EwmaSpeed(decor.SizeB1024(0), "% .1f", 30),
 			decor.Name(" | "),
 			decor.EwmaETA(decor.ET_STYLE_MMSS, 30),
@@ -381,10 +433,11 @@ func newFileBar(p *mpb.Progress, name string, total int64) *mpb.Bar {
 	)
 }
 
+// newTotalBar 为目录传输创建一个显示总进度的进度条。
 func newTotalBar(p *mpb.Progress, total int64) *mpb.Bar {
 	return p.New(total,
 		mpb.BarStyle(),
-		mpb.BarPriority(1), // 总体放在第二行
+		mpb.BarPriority(1),
 		mpb.PrependDecorators(
 			decor.Name("TOTAL ", decor.WC{C: decor.DindentRight}),
 			decor.CountersKibiByte("% .1f / % .1f"),
@@ -392,7 +445,6 @@ func newTotalBar(p *mpb.Progress, total int64) *mpb.Bar {
 		mpb.AppendDecorators(
 			decor.Percentage(),
 			decor.Name(" | "),
-			// FIX: TOTAL 也显示 EWMA 速度
 			decor.EwmaSpeed(decor.SizeB1024(0), "% .1f", 30),
 			decor.Name(" | "),
 			decor.EwmaETA(decor.ET_STYLE_MMSS, 30),
@@ -400,7 +452,7 @@ func newTotalBar(p *mpb.Progress, total int64) *mpb.Bar {
 	)
 }
 
-// sendXfer 现在接受 seed：用于 XXH3-128 带种子校验
+// sendXfer 处理文件或目录的发送逻辑。
 func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string, ui *uiConsole, seed uint64) error {
 	xs, err := h.NewStream(ctx, remote, protoXfer)
 	if err != nil {
@@ -408,10 +460,9 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 	}
 	defer xs.Close()
 
+	// 1. 根据类型 (file/dir) 创建传输提议。
 	var off xferOffer
 	switch kind {
-	case "text":
-		off = xferOffer{Kind: "text", Name: "message.txt", Size: int64(len(arg))}
 	case "file":
 		st, err := os.Stat(arg)
 		if err != nil {
@@ -438,6 +489,7 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 		return fmt.Errorf("unknown kind %q", kind)
 	}
 
+	// 2. 发送提议并等待对方响应。
 	b, _ := json.Marshal(off)
 	if err := writeFrame(xs, frameOffer, b); err != nil {
 		return err
@@ -453,7 +505,7 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 		return fmt.Errorf("unexpected response")
 	}
 
-	// 进度条容器（仅 file/dir）
+	// 3. 初始化进度条。
 	var p *mpb.Progress
 	var fileBar, totalBar *mpb.Bar
 	if (off.Kind == "file" && off.Size > 0) || (off.Kind == "dir" && off.Size > 0) {
@@ -462,39 +514,37 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 			mpb.WithRefreshRate(120*time.Millisecond),
 			mpb.WithOutput(os.Stderr),
 		)
-		if off.Kind == "file" && off.Size > 0 {
-			fileBar = newFileBar(p, off.Name, off.Size)
-		} else if off.Kind == "dir" && off.Size > 0 {
+		if off.Kind == "dir" {
 			totalBar = newTotalBar(p, off.Size)
 		}
 	} else if off.Kind == "file" && off.Size == 0 {
-		ui.println("note: sending empty file; no per-file progress bar will be shown")
+		ui.println("note: sending empty file")
 	}
-
 	createdBar := func() bool { return fileBar != nil || totalBar != nil }
 
-	// 发送单个文件（计算/携带 XXH3-128-seed + 等待接收端 ACK/NACK，并驱动进度条）
+	// 4. 定义发送单个文件的辅助函数，包含完整性校验和重试逻辑。
 	sendOneAttempt := func(name string, r io.Reader, size int64, expectHash string) error {
-		// 目录模式：切换“当前文件”条
-		if p != nil && totalBar != nil {
-			if fileBar != nil {
+		// 为当前文件创建或更新进度条
+		if p != nil {
+			if totalBar != nil && fileBar != nil {
 				fileBar.Abort(true)
 				fileBar.Wait()
 			}
 			if size > 0 {
 				fileBar = newFileBar(p, name, size)
-				fileBar.DecoratorAverageAdjust(time.Now())
 			} else {
-				fileBar = nil
+				fileBar = nil // 零大小文件不显示进度条
 			}
 		}
-		if fileBar != nil && totalBar == nil {
+
+		if fileBar != nil {
 			fileBar.DecoratorAverageAdjust(time.Now())
 		}
 		if totalBar != nil {
 			totalBar.DecoratorAverageAdjust(time.Now())
 		}
 
+		// 发送文件头信息 (元数据)
 		hdr := map[string]any{
 			"name": name,
 			"size": size,
@@ -506,9 +556,10 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 			return err
 		}
 
+		// 分块发送文件数据
 		buf := make([]byte, chunkSize)
 		var sent int64
-		hw := xxh3.NewSeed(seed) // 防御性：边发边自校验发送侧数据流（与 expectHash 对比）
+		hw := xxh3.NewSeed(seed)
 		for {
 			if size >= 0 && sent >= size {
 				break
@@ -521,6 +572,7 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 				if err := writeFrame(xs, frameChunk, buf[:n]); err != nil {
 					return err
 				}
+				// 更新进度条
 				if fileBar != nil {
 					fileBar.EwmaIncrBy(n, time.Since(start))
 				}
@@ -542,15 +594,13 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 			fileBar.SetTotal(size, true)
 		}
 
-		// 等待接收端反馈：ACK / NACK
+		// 等待接收方的确认 (ACK/NACK)
 		typ, _, err := readFrame(xs)
 		if err != nil {
 			return err
 		}
 		switch typ {
 		case frameFileAck:
-			// 可选：对比发送侧流式计算是否与 expectHash 一致（调试/防御）
-			// 修正 #1: 将不可寻址的返回值先赋给变量
 			sumBytes := hw.Sum128().Bytes()
 			got := fmt.Sprintf("%x", sumBytes[:])
 			if expectHash != "" && got != expectHash {
@@ -564,7 +614,7 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 		}
 	}
 
-	// 预计算 XXH3-128（带 seed）
+	// 5. 定义计算文件哈希的辅助函数。
 	hashFile := func(path string) (string, int64, error) {
 		f, err := os.Open(path)
 		if err != nil {
@@ -583,26 +633,11 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 		return fmt.Sprintf("%x", sum[:]), st.Size(), nil
 	}
 
+	// 6. 开始传输。
 	failedFiles := make([]string, 0)
-	const maxRetries = 3 // 收到 NACK 后重传次数
+	const maxRetries = 3
 
 	switch off.Kind {
-	case "text":
-		hv := fmt.Sprintf("%x", xxh3.HashString128Seed(arg, seed).Bytes())
-		attempt := 0
-		for {
-			err := sendOneAttempt(off.Name, strings.NewReader(arg), off.Size, hv)
-			if err == nil || attempt >= maxRetries {
-				if err != nil {
-					failedFiles = append(failedFiles, off.Name)
-				}
-				break
-			}
-			attempt++
-			ui.println(fmt.Sprintf("hash mismatch, retrying text (%d/%d)…", attempt, maxRetries))
-			// 轻微退避
-			time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
-		}
 	case "file":
 		hv, sz, err := hashFile(arg)
 		if err != nil {
@@ -669,7 +704,7 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 		}
 	}
 
-	// 先通知接收端传输结束，再等待本地进度条退出
+	// 7. 发送传输结束信号并清理。
 	if err := writeFrame(xs, frameXferDone, nil); err != nil {
 		return err
 	}
@@ -687,11 +722,13 @@ func sendXfer(ctx context.Context, h host.Host, remote peer.ID, kind, arg string
 	return nil
 }
 
+// promptReq 用于在主输入循环和需要用户输入的其他协程之间传递请求。
 type promptReq struct {
 	question string
 	resp     chan bool
 }
 
+// tryDequeuePrompt 尝试从通道中非阻塞地取出一个提示请求。
 func tryDequeuePrompt(ch chan *promptReq) *promptReq {
 	select {
 	case p := <-ch:
@@ -701,9 +738,10 @@ func tryDequeuePrompt(ch chan *promptReq) *promptReq {
 	}
 }
 
-// handleIncomingXfer 现在也接受 seed：用于 XXH3-128 带种子校验
-func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, outDir string, askYesNo func(q string, timeout time.Duration) bool, ui *uiConsole, seed uint64) {
+// handleIncomingXfer 处理接收文件或目录的逻辑。
+func handleIncomingXfer(_ context.Context, _ host.Host, xs network.Stream, outDir string, askYesNo func(q string, timeout time.Duration) bool, ui *uiConsole, seed uint64) {
 	defer xs.Close()
+	// 1. 读取传输提议。
 	typ, payload, err := readFrame(xs)
 	if err != nil || typ != frameOffer {
 		return
@@ -711,10 +749,9 @@ func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, out
 	var off xferOffer
 	_ = json.Unmarshal(payload, &off)
 
+	// 2. 询问用户是否接受。
 	info := ""
 	switch off.Kind {
-	case "text":
-		info = fmt.Sprintf("Peer wants to send a TEXT (%d bytes).", off.Size)
 	case "file":
 		info = fmt.Sprintf("Peer wants to send file %q (%d bytes).", off.Name, off.Size)
 	case "dir":
@@ -729,13 +766,31 @@ func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, out
 		return
 	}
 
+	// 3. 初始化进度条。
+	var p *mpb.Progress
+	var fileBar, totalBar *mpb.Bar
+	if (off.Kind == "file" && off.Size > 0) || (off.Kind == "dir" && off.Size > 0) {
+		p = mpb.New(
+			mpb.WithWidth(64),
+			mpb.WithRefreshRate(120*time.Millisecond),
+			mpb.WithOutput(os.Stderr),
+		)
+		if off.Kind == "file" {
+			fileBar = newFileBar(p, off.Name, off.Size)
+		} else {
+			totalBar = newTotalBar(p, off.Size)
+		}
+	}
+	createdBar := func() bool { return p != nil && (fileBar != nil || totalBar != nil) }
+
+	// 4. 循环处理接收到的帧。
 	var fw *os.File
 	var dstPath string
 	var expectHash string
 	var algo string
 	failedFiles := make([]string, 0)
-	// 修正 #2: 避免与函数参数 h 冲突，重命名为 hasher
 	hasher := xxh3.NewSeed(seed)
+	lastTick := time.Now()
 
 	for {
 		typ, payload, err = readFrame(xs)
@@ -743,7 +798,7 @@ func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, out
 			return
 		}
 		switch typ {
-		case frameFileHdr:
+		case frameFileHdr: // 收到文件头，准备写入文件
 			var hdr struct {
 				Name string `json:"name"`
 				Size int64  `json:"size"`
@@ -760,41 +815,84 @@ func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, out
 			}
 			expectHash = strings.ToLower(strings.TrimSpace(hdr.Hash))
 			algo = strings.ToLower(strings.TrimSpace(hdr.Algo))
-			// 修正 #3: 使用新的变量名 hasher
 			hasher.Reset()
-		case frameChunk:
+			lastTick = time.Now()
+
+			// 更新当前文件的进度条
+			if p != nil {
+				if totalBar != nil {
+					if fileBar != nil {
+						fileBar.Abort(true)
+						fileBar.Wait()
+					}
+					if hdr.Size > 0 {
+						fileBar = newFileBar(p, hdr.Name, hdr.Size)
+						fileBar.DecoratorAverageAdjust(time.Now())
+					} else {
+						fileBar = nil
+					}
+				} else if fileBar == nil && hdr.Size > 0 {
+					fileBar = newFileBar(p, hdr.Name, hdr.Size)
+					fileBar.DecoratorAverageAdjust(time.Now())
+				}
+				if totalBar != nil {
+					totalBar.DecoratorAverageAdjust(time.Now())
+				}
+			}
+
+		case frameChunk: // 收到数据块，写入文件并更新哈希
 			if fw != nil {
 				_, _ = fw.Write(payload)
-				// 修正 #4: 使用新的变量名 hasher
 				_, _ = hasher.Write(payload)
+				now := time.Now()
+				dt := now.Sub(lastTick)
+				lastTick = now
+				if fileBar != nil {
+					fileBar.EwmaIncrBy(len(payload), dt)
+				}
+				if totalBar != nil {
+					totalBar.EwmaIncrBy(len(payload), dt)
+				}
 			}
-		case frameFileDone:
+		case frameFileDone: // 单个文件接收完成，校验哈希
 			if fw != nil {
 				_ = fw.Close()
 				fw = nil
-				// 修正 #5: 使用新的变量名 hasher，并修复不可寻址值切片问题
 				sumBytes := hasher.Sum128().Bytes()
 				got := fmt.Sprintf("%x", sumBytes[:])
 				if algo != "xxh3-128-seed" || (expectHash != "" && got != expectHash) {
+					// 校验失败，删除文件并发送 NACK
 					_ = os.Remove(dstPath)
 					_ = writeFrame(xs, frameFileNack, nil)
 					failedFiles = append(failedFiles, dstPath)
 					ui.println("✗ hash mismatch, removed: " + dstPath)
 				} else {
+					// 校验成功，发送 ACK
+					if fileBar != nil {
+						fileBar.SetTotal(fileBar.Current(), true)
+					}
 					_ = writeFrame(xs, frameFileAck, nil)
 					ui.println("← received: " + dstPath)
 				}
 			}
-		case frameXferDone:
+		case frameXferDone: // 全部传输完成，清理并退出
 			if len(failedFiles) > 0 {
 				ui.println("warning: integrity check failed for the following files (removed):")
 				for _, f := range failedFiles {
 					ui.println("  - " + f)
 				}
 			}
+			if p != nil && createdBar() {
+				p.Wait()
+				ui.rl.Refresh()
+			}
 			return
-		case frameError:
+		case frameError: // 收到错误信息
 			ui.println("← xfer error: " + string(payload))
+			if p != nil && createdBar() {
+				p.Wait()
+				ui.rl.Refresh()
+			}
 			return
 		default:
 			return
@@ -802,13 +900,15 @@ func handleIncomingXfer(ctx context.Context, h host.Host, xs network.Stream, out
 	}
 }
 
-// ---------- PAKE（SPAKE2）+ key-confirm + SAS ----------
+// ---------- PAKE 密钥协商 + 密钥确认 + 短认证字符串(SAS) ----------
 const (
-	framePakeMsg     = byte(0x10)
-	framePakeConfirm = byte(0x11)
-	framePakeAbort   = byte(0x1F)
+	framePakeMsg     = byte(0x10) // PAKE 协议消息
+	framePakeConfirm = byte(0x11) // 密钥确认消息
+	framePakeAbort   = byte(0x1F) // 协商中止
 )
 
+// buildTranscript 构建一个唯一的会话摘要，用于密钥派生和确认。
+// 它将双方的 PeerID 按字典序排序，以确保双方生成相同的摘要。
 func buildTranscript(nameplate string, proto protocol.ID, a, b peer.ID) []byte {
 	ids := []string{a.String(), b.String()}
 	if ids[0] > ids[1] {
@@ -817,6 +917,8 @@ func buildTranscript(nameplate string, proto protocol.ID, a, b peer.ID) []byte {
 	s := strings.Join([]string{"wormhole-pake-v1", nameplate, string(proto), ids[0], ids[1]}, "|")
 	return []byte(s)
 }
+
+// hkdfBytes 使用 HKDF 从输入密钥材料(ikm)派生出指定长度的密钥。
 func hkdfBytes(ikm []byte, label string, transcript []byte, n int) []byte {
 	info := append([]byte(label+"|"), transcript...)
 	r := hkdf.New(sha256.New, ikm, nil, info)
@@ -824,6 +926,7 @@ func hkdfBytes(ikm []byte, label string, transcript []byte, n int) []byte {
 	_, _ = io.ReadFull(r, out)
 	return out
 }
+
 func emojiList() []string {
 	return []string{
 		"😀", "😂", "😅", "😊", "😍", "😎", "🤔", "😴",
@@ -836,20 +939,23 @@ func emojiList() []string {
 		"🍇", "🍋", "🍪", "🍫", "🍦", "🍩", "🍭", "🥐",
 	}
 }
+
+// sasFromKey 从共享密钥生成一个短认证字符串(SAS)，由5个 emoji 组成，用于人工验证。
 func sasFromKey(K []byte, transcript []byte) string {
 	em := emojiList()
-	b := hkdfBytes(K, "sas", transcript, 4) // 32 bits
+	b := hkdfBytes(K, "sas", transcript, 4) // 派生32位数据
 	acc := uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
 	parts := make([]string, 0, 5)
 	for i := 0; i < 5; i++ {
-		idx := (acc >> (i * 6)) & 0x3F
+		idx := (acc >> (i * 6)) & 0x3F // 每6位映射一个 emoji
 		parts = append(parts, em[idx%uint32(len(em))])
 	}
 	return strings.Join(parts, " ")
 }
 
-// roleA=true 表示拨号端（A）；false 表示监听端（B）
-func runPAKEAndConfirm(ctx context.Context, s network.Stream, roleA bool, passphrase, nameplate string, proto protocol.ID, local, remote peer.ID) ([]byte, error) {
+// runPAKEAndConfirm 执行 SPAKE2 密钥协商和密钥确认流程。
+// roleA=true 表示是发起方(Dialer)。
+func runPAKEAndConfirm(_ context.Context, s network.Stream, roleA bool, passphrase, nameplate string, proto protocol.ID, local, remote peer.ID) ([]byte, error) {
 	transcript := buildTranscript(nameplate, proto, local, remote)
 	pw := spake2.NewPassword(passphrase)
 	var state spake2.SPAKE2
@@ -860,18 +966,22 @@ func runPAKEAndConfirm(ctx context.Context, s network.Stream, roleA bool, passph
 	}
 
 	my := state.Start()
-	if roleA {
+	if roleA { // 发起方流程
+		// 1. 发送自己的 PAKE 消息
 		if err := writeFrame(s, framePakeMsg, my); err != nil {
 			return nil, err
 		}
+		// 2. 接收对方的 PAKE 消息
 		typ, peerMsg, err := readFrame(s)
 		if err != nil || typ != framePakeMsg {
 			return nil, fmt.Errorf("pake: bad peer msg")
 		}
+		// 3. 计算共享密钥 K
 		K, err := state.Finish(peerMsg)
 		if err != nil {
 			return nil, fmt.Errorf("pake finish: %w", err)
 		}
+		// 4. 进行密钥确认：派生 Kc，计算并发送自己的 MAC
 		Kc := hkdfBytes(K, "confirm", transcript, 32)
 		macA := hmac.New(sha256.New, Kc)
 		macA.Write([]byte("A|"))
@@ -879,6 +989,7 @@ func runPAKEAndConfirm(ctx context.Context, s network.Stream, roleA bool, passph
 		if err := writeFrame(s, framePakeConfirm, macA.Sum(nil)); err != nil {
 			return nil, err
 		}
+		// 5. 接收并验证对方的 MAC
 		typ, tagB, err := readFrame(s)
 		if err != nil || typ != framePakeConfirm {
 			return nil, fmt.Errorf("pake: no cB")
@@ -891,7 +1002,7 @@ func runPAKEAndConfirm(ctx context.Context, s network.Stream, roleA bool, passph
 			return nil, fmt.Errorf("pake: key-confirm failed (cB)")
 		}
 		return K, nil
-	} else {
+	} else { // 响应方流程 (与发起方对称)
 		typ, peerMsg, err := readFrame(s)
 		if err != nil || typ != framePakeMsg {
 			return nil, fmt.Errorf("pake: bad peer msg")
@@ -926,7 +1037,9 @@ func runPAKEAndConfirm(ctx context.Context, s network.Stream, roleA bool, passph
 	}
 }
 
-// ---------- /chat 会话（集成 PAKE + SAS + 路径提示） ----------
+// ---------- 聊天会话 (/chat) ----------
+
+// readLineWithDeadline 从流中读取一行，带有超时。
 func readLineWithDeadline(rw *bufio.ReadWriter, s network.Stream, d time.Duration) (string, error) {
 	_ = s.SetReadDeadline(time.Now().Add(d))
 	defer s.SetReadDeadline(time.Time{})
@@ -934,23 +1047,18 @@ func readLineWithDeadline(rw *bufio.ReadWriter, s network.Stream, d time.Duratio
 	return strings.TrimRight(line, "\r\n"), err
 }
 
-func printConnSummary(ui *uiConsole, local, remote ma.Multiaddr) {
-	ui.println("connected:")
-	ui.println("  local : " + local.String())
-	ui.println("  remote: " + remote.String())
-}
-
 func helpText() string {
 	return `Commands:
-  /send -t <text>          send a short text
-  /send -f <file>          send a file
-  /send -d <dir>           send a directory recursively
-  /bye                     close the chat`
+/peer                  show peer id & current path
+/send -f <file>        send a file
+/send -d <dir>         send a directory recursively
+/bye                   close the chat`
 }
 
-// ---- 路径识别（DIRECT / RELAY via <RelayID>） ----
+// reRelayBeforeCircuit 用于从 multiaddr 中识别中继地址。
 var reRelayBeforeCircuit = regexp.MustCompile(`/p2p/([^/]+)/p2p-circuit`)
 
+// transportHint 从 multiaddr 中猜测传输协议类型。
 func transportHint(a ma.Multiaddr) string {
 	s := a.String()
 	switch {
@@ -971,15 +1079,17 @@ func transportHint(a ma.Multiaddr) string {
 	}
 }
 
+// pathInfo 存储关于连接路径的分类信息。
 type pathInfo struct {
-	Kind       string // "DIRECT" or "RELAY"
-	RelayID    string // if Kind == RELAY
-	RelayVia   string // base relay addr
+	Kind       string // "DIRECT" 或 "RELAY"
+	RelayID    string
+	RelayVia   string
 	Transport  string
 	LocalAddr  string
 	RemoteAddr string
 }
 
+// classifyPath 分析一个 libp2p 连接，判断它是直连还是通过中继。
 func classifyPath(c network.Conn) pathInfo {
 	pi := pathInfo{
 		LocalAddr:  c.LocalMultiaddr().String(),
@@ -1013,6 +1123,7 @@ func classifyPath(c network.Conn) pathInfo {
 	return pi
 }
 
+// askYesNoWithReadline 向用户提问并等待 y/N 回答，有超时。
 func askYesNoWithReadline(ui *uiConsole, question string, timeout time.Duration, defaultNo bool) bool {
 	restore := ui.promptQuestionAndRestore(question)
 	defer restore()
@@ -1031,12 +1142,13 @@ func askYesNoWithReadline(ui *uiConsole, question string, timeout time.Duration,
 		al := strings.ToLower(a)
 		return al == "y" || al == "yes"
 	case <-time.After(timeout):
-		ui.println("")    // 换行美化
-		return !defaultNo // 希望超时默认接受时返回 true；默认拒绝则 false
+		ui.println("")
+		return !defaultNo
 	}
 }
 
-// —— 新增：中心上报的便捷函数 —— //
+// 异步向控制服务器报告会话状态
+
 func postConsumeAsync(controlURL, nameplate string) {
 	go func() {
 		_ = httpPostJSON(context.Background(), controlURL, "/v1/consume",
@@ -1050,12 +1162,13 @@ func postFailAsync(controlURL, nameplate string) {
 	}()
 }
 
+// runAccepted 是在 P2P 连接建立后运行的核心函数，负责处理握手、聊天和文件传输。
 func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL, outDir string, verify bool, nameplate, passphrase string) {
-	// 如果（真正的）SIGINT 到达，立刻打断读并半关写，避免读循环阻塞
+	// 确保在上下文取消时关闭流
 	go func() {
 		<-ctx.Done()
-		_ = s.CloseRead()  // 立刻让扫描器/reader返回错误（不等远端）
-		_ = s.CloseWrite() // 通知对端我们不再写
+		_ = s.CloseRead()
+		_ = s.CloseWrite()
 	}()
 	remote := s.Conn().RemotePeer()
 	rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
@@ -1068,16 +1181,17 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 	}
 
 	handshakeSuccess := false
-	var xferSeed uint64 // XXH3 的 64-bit 种子
+	var xferSeed uint64 // 用于文件传输完整性校验的种子
 	defer func() {
-		// 统一的握手失败回收：若未成功，则 fail+consume
 		if !handshakeSuccess {
 			postFailAsync(controlURL, nameplate)
 		}
 	}()
 
-	// —— 握手：HELLO -> (PAKE+confirm) -> 人工确认 ——
+	// ---------- 握手流程 ----------
+	// 包含 PAKE 协商、SAS 验证和用户确认。
 	if s.Stat().Direction == network.DirInbound {
+		// 作为被连接方 (Host)
 		line, err := readLineWithDeadline(rw, s, 30*time.Second)
 		if err != nil || !strings.HasPrefix(line, chatHello) {
 			ui.logln("handshake failed: did not receive valid HELLO in time")
@@ -1092,12 +1206,13 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 			go ui.Close()
 			return
 		}
-		// 从 K 推导 XFER 用 seed（用 protoXfer 的 transcript）
+		// 从共享密钥派生出文件传输用的哈希种子
 		xferSeed = binary.LittleEndian.Uint64(hkdfBytes(K, "xfer-xxh3-seed", buildTranscript(nameplate, protoXfer, h.ID(), remote), 8))
 
+		// 生成并显示 SAS，等待用户确认
 		sas := sasFromKey(K, buildTranscript(nameplate, protoChat, h.ID(), remote))
-		ui.logf("Remote PeerID: %s | SAS: %s", remote.String(), sas)
-		prompt := fmt.Sprintf("[%s] Confirm peer within 30s [y/N]: ", ts())
+		printPeerVerifyCard(ui, remote, sas)
+		prompt := fmt.Sprintf("%s Confirm peer within 30s [y/N]: ", ts())
 		accepted := askYesNoWithReadline(ui, prompt, 30*time.Second, true)
 		if !accepted {
 			fmt.Fprintln(rw, chatReject)
@@ -1137,6 +1252,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 			return
 		}
 	} else {
+		// 作为连接方 (Connect)
 		fmt.Fprintf(rw, "%s %s\n", chatHello, h.ID().String())
 		if err := rw.Flush(); err != nil {
 			ui.logln("handshake failed: cannot write hello")
@@ -1151,16 +1267,16 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 			go ui.Close()
 			return
 		}
-		// 从 K 推导 XFER 用 seed（用 protoXfer 的 transcript）
 		xferSeed = binary.LittleEndian.Uint64(hkdfBytes(K, "xfer-xxh3-seed", buildTranscript(nameplate, protoXfer, h.ID(), remote), 8))
 
 		sas := sasFromKey(K, buildTranscript(nameplate, protoChat, h.ID(), remote))
-		ui.logf("Waiting for peer confirmation… | SAS: %s | remote=%s", sas, remote)
+		printPeerVerifyCard(ui, remote, sas)
+		ui.logln("Waiting for peer confirmation…")
 
 		localAccepted := true
 		if verify {
 			localAccepted = askYesNoWithReadline(ui,
-				fmt.Sprintf("[%s] Verify peer locally within 30s [y/N]: ", ts()),
+				fmt.Sprintf("%s Verify peer locally within 30s [y/N]: ", ts()),
 				30*time.Second, true)
 			if !localAccepted {
 				_ = s.Close()
@@ -1200,20 +1316,10 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 		}
 	}
 
-	printConnSummary(ui, s.Conn().LocalMultiaddr(), s.Conn().RemoteMultiaddr())
-
-	// 路径展示
 	pi := classifyPath(s.Conn())
-	if pi.Kind == "RELAY" {
-		ui.println(fmt.Sprintf("path: RELAY via %s (%s)", pi.RelayID, pi.Transport))
-		if verbose {
-			ui.println("via addr: " + pi.RelayVia)
-		}
-	} else {
-		ui.println(fmt.Sprintf("path: DIRECT (%s)", pi.Transport))
-	}
+	printConnCard(ui, pi, s.Conn().LocalMultiaddr(), s.Conn().RemoteMultiaddr())
 
-	// 安装 XFER handler + 提示通道（闭包捕获 xferSeed）
+	// 设置文件传输流处理器
 	promptCh := make(chan *promptReq, 4)
 	askYesNo := func(q string, timeout time.Duration) bool {
 		pr := &promptReq{question: q, resp: make(chan bool, 1)}
@@ -1240,7 +1346,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 	var once sync.Once
 	thisConn := s.Conn()
 
-	// 连接断开时：立即停止 readline（异步 Close），结束输入循环
+	// 监听连接断开事件
 	notifiee := &network.NotifyBundle{
 		DisconnectedF: func(_ network.Network, c network.Conn) {
 			if c == thisConn {
@@ -1255,7 +1361,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 	h.Network().Notify(notifiee)
 	defer h.Network().StopNotify(notifiee)
 
-	// 接收对端消息 → 安全打印
+	// 接收循环 (goroutine)
 	go func() {
 		r := bufio.NewScanner(rw.Reader)
 		for r.Scan() {
@@ -1280,7 +1386,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 		})
 	}()
 
-	// 输入循环（readline）
+	// 用户输入循环 (goroutine)
 	go func() {
 		w := rw.Writer
 
@@ -1297,22 +1403,32 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 				_ = s.CloseWrite()
 				go ui.Close()
 				return true
+
+			case cmd == "/peer":
+				pi := classifyPath(thisConn)
+				ui.println("peer id: " + thisConn.RemotePeer().String())
+				if pi.Kind == "RELAY" {
+					ui.println(fmt.Sprintf("path   : RELAY via %s (%s)", pi.RelayID, pi.Transport))
+					if verbose {
+						ui.println("via    : " + pi.RelayVia)
+					}
+				} else {
+					ui.println(fmt.Sprintf("path   : DIRECT (%s)", pi.Transport))
+				}
+				ui.println("local  : " + thisConn.LocalMultiaddr().String())
+				ui.println("remote : " + thisConn.RemoteMultiaddr().String())
+				return true
+
 			case strings.HasPrefix(cmd, "/send "):
 				rest := strings.TrimSpace(strings.TrimPrefix(cmd, "/send"))
 				if rest == "" {
-					ui.println("usage: /send -t <text> | -f <file> | -d <dir>")
+					ui.println("usage: /send -f <file> | -d <dir>")
 					return true
 				}
 				as := strings.Fields(rest)
-				var textArg, fileArg, dirArg string
+				var fileArg, dirArg string
 				for i := 0; i < len(as); i++ {
 					switch as[i] {
-					case "-t":
-						i++
-						if i < len(as) {
-							textArg = strings.Join(as[i:], " ")
-							i = len(as)
-						}
 					case "-f":
 						i++
 						if i < len(as) {
@@ -1328,15 +1444,13 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 				kind := ""
 				arg := ""
 				switch {
-				case textArg != "":
-					kind, arg = "text", textArg
 				case fileArg != "":
 					kind, arg = "file", fileArg
 				case dirArg != "":
 					kind, arg = "dir", dirArg
 				}
 				if kind == "" {
-					ui.println("usage: /send -t <text> | -f <file> | -d <dir>")
+					ui.println("usage: /send -f <file> | -d <dir>")
 					return true
 				}
 				ui.println("sending...")
@@ -1385,6 +1499,7 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 				return
 			}
 			line := strings.TrimRight(txt, "\r\n")
+			// 检查是否有待处理的用户提示 (如文件接收确认)
 			if pending := tryDequeuePrompt(promptCh); pending != nil {
 				al := strings.ToLower(strings.TrimSpace(line))
 				pending.resp <- (al == "y" || al == "yes")
@@ -1400,32 +1515,33 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL,
 			if trim == "" {
 				continue
 			}
+			// 普通文本作为聊天消息发送
 			ui.println("→ " + line)
 			fmt.Fprintln(w, line)
 			_ = w.Flush()
 		}
 	}()
 
+	// 等待会话结束
 	reason := <-reasonCh
 	ui.println(reason)
 
-	// 确保两侧都被打断并收尾
 	_ = s.CloseRead()
 	_ = s.CloseWrite()
 	_ = s.Close()
 	go ui.Close()
-	// 函数直接返回，不做阻塞等待
 }
 
-// ---------- libp2p host & 连接/发现 ----------
+// ---------- libp2p 主机和发现 ----------
 
-// 基于服务端下发的静态 relay 候选，启用 AutoRelay 与 DCUtR，开启 NATPortMap
+// newHost 创建并配置一个新的 libp2p 主机实例。
 func newHost(staticRelay *peer.AddrInfo, extraListen []ma.Multiaddr) (host.Host, error) {
 	opts := []libp2p.Option{
-		libp2p.NATPortMap(),
-		libp2p.EnableHolePunching(),
+		libp2p.NATPortMap(),         // 尝试使用 UPnP/NAT-PMP 进行端口映射
+		libp2p.EnableHolePunching(), // 启用 NAT 穿透
 	}
 	if staticRelay != nil {
+		// 配置一个静态中继节点，用于 AutoRelay
 		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays([]peer.AddrInfo{*staticRelay}))
 	}
 	if len(extraListen) > 0 {
@@ -1436,13 +1552,14 @@ func newHost(staticRelay *peer.AddrInfo, extraListen []ma.Multiaddr) (host.Host,
 	if err != nil {
 		return nil, err
 	}
-	pingsvc.NewPingService(h)
+	pingsvc.NewPingService(h) // 启用 ping 服务以保持连接活跃
 	if staticRelay != nil {
 		h.Peerstore().AddAddrs(staticRelay.ID, staticRelay.Addrs, time.Hour)
 	}
 	return h, nil
 }
 
+// connectAny 尝试连接到地址列表中的任何一个节点，成功一个即返回。
 func connectAny(ctx context.Context, h host.Host, addrs []peer.AddrInfo) (*peer.AddrInfo, error) {
 	for _, ai := range addrs {
 		if err := h.Connect(ctx, ai); err == nil {
@@ -1452,6 +1569,7 @@ func connectAny(ctx context.Context, h host.Host, addrs []peer.AddrInfo) (*peer.
 	return nil, fmt.Errorf("connectAny failed")
 }
 
+// reserveAnyRelay 尝试在给定的中继列表中预订一个槽位。
 func reserveAnyRelay(ctx context.Context, h host.Host, relays []peer.AddrInfo) *peer.AddrInfo {
 	for _, ai := range relays {
 		_ = h.Connect(ctx, ai)
@@ -1462,7 +1580,7 @@ func reserveAnyRelay(ctx context.Context, h host.Host, relays []peer.AddrInfo) *
 	return nil
 }
 
-// 构造“经 relay 的自我地址”
+// buildCircuitSelfAddrs 构建通过中继节点访问自身的 p2p-circuit 地址。
 func buildCircuitSelfAddrs(relay *peer.AddrInfo, self peer.ID) []ma.Multiaddr {
 	var out []ma.Multiaddr
 	if relay == nil {
@@ -1481,15 +1599,16 @@ func buildCircuitSelfAddrs(relay *peer.AddrInfo, self peer.ID) []ma.Multiaddr {
 	return out
 }
 
+// rendezvousAddrsFactory 是一个地址工厂函数，用于过滤和添加要向汇合点宣告的地址。
 func rendezvousAddrsFactory(h host.Host, reservedRelay *peer.AddrInfo, allowLocal bool) rzv.AddrsFactory {
 	return func(addrs []ma.Multiaddr) []ma.Multiaddr {
 		seen := make(map[string]bool)
 		var out []ma.Multiaddr
 		for _, a := range addrs {
-			if isUnspecified(a) {
+			if isUnspecified(a) { // 过滤掉 0.0.0.0
 				continue
 			}
-			if allowLocal || !isLoopbackOrPrivate(a) {
+			if allowLocal || !isLoopbackOrPrivate(a) { // 过滤掉私有/环回地址
 				k := a.String()
 				if !seen[k] {
 					out = append(out, a)
@@ -1497,6 +1616,7 @@ func rendezvousAddrsFactory(h host.Host, reservedRelay *peer.AddrInfo, allowLoca
 				}
 			}
 		}
+		// 添加通过已预订中继的 circuit 地址
 		if reservedRelay != nil {
 			for _, via := range buildCircuitSelfAddrs(reservedRelay, h.ID()) {
 				k := via.String()
@@ -1513,7 +1633,7 @@ func rendezvousAddrsFactory(h host.Host, reservedRelay *peer.AddrInfo, allowLoca
 	}
 }
 
-// 从远端 relayed 地址中提取它所用的中继
+// mergeRelaysFromRemote 将从远程节点地址中提取的中继信息与已知的中继列表合并。
 func mergeRelaysFromRemote(remote peer.AddrInfo, known []peer.AddrInfo) []peer.AddrInfo {
 	merged := make(map[peer.ID]peer.AddrInfo)
 	for _, r := range known {
@@ -1548,7 +1668,7 @@ func mergeRelaysFromRemote(remote peer.AddrInfo, known []peer.AddrInfo) []peer.A
 	return out
 }
 
-// 判断发现到的远端地址是否“全部为 relayed”
+// allRelayedAddrs 检查一个节点的所有地址是否都是中继地址。
 func allRelayedAddrs(ai peer.AddrInfo) bool {
 	if len(ai.Addrs) == 0 {
 		return false
@@ -1561,12 +1681,13 @@ func allRelayedAddrs(ai peer.AddrInfo) bool {
 	return true
 }
 
-// tryOpenChat：在窗口期内循环 Discover + 拨号
+// tryOpenChat 尝试通过汇合点发现对等节点并建立聊天流。
 func tryOpenChat(ctx context.Context, h host.Host, rzvc rzv.RendezvousClient, topic string, relays []peer.AddrInfo, maxWait time.Duration, relayFirst bool) (network.Stream, error) {
 	deadline := time.Now().Add(maxWait)
 	var lastErr error
 
 	for time.Now().Before(deadline) {
+		// 1. 通过汇合点发现同一主题下的其他节点。
 		infos, _, err := rzvc.Discover(ctx, topic, 64, nil)
 		if err != nil || len(infos) == 0 {
 			if err != nil {
@@ -1578,6 +1699,7 @@ func tryOpenChat(ctx context.Context, h host.Host, rzvc rzv.RendezvousClient, to
 			continue
 		}
 
+		// 2. 定义直连和通过中继连接的辅助函数。
 		dialDirect := func(remote peer.AddrInfo) (network.Stream, error) {
 			dialCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 			defer cancel()
@@ -1609,26 +1731,25 @@ func tryOpenChat(ctx context.Context, h host.Host, rzvc rzv.RendezvousClient, to
 			return h.NewStream(dialCtx, remote.ID, protoChat)
 		}
 
+		// 3. 遍历发现的节点，尝试建立连接。
 		for _, remote := range infos {
 			remoteRelays := mergeRelaysFromRemote(remote, relays)
 			preferRelay := relayFirst || allRelayedAddrs(remote) || len(remoteRelays) > 0
 
 			var s network.Stream
 			var err error
-			if preferRelay {
+			if preferRelay { // 优先尝试中继
 				if s, err = dialViaRelay(remote, remoteRelays); err == nil {
 					return s, nil
 				}
-				lastErr = err
 				if s, err = dialDirect(remote); err == nil {
 					return s, nil
 				}
 				lastErr = err
-			} else {
+			} else { // 优先尝试直连
 				if s, err = dialDirect(remote); err == nil {
 					return s, nil
 				}
-				lastErr = err
 				if s, err = dialViaRelay(remote, remoteRelays); err == nil {
 					return s, nil
 				}
@@ -1648,6 +1769,7 @@ func tryOpenChat(ctx context.Context, h host.Host, rzvc rzv.RendezvousClient, to
 func main() {
 	var controlURL string
 	var code string
+	var codeShort string
 	var mode string
 	var listen string
 	var outDir string
@@ -1656,8 +1778,9 @@ func main() {
 	var dlDir string
 
 	flag.StringVar(&controlURL, "control", "http://127.0.0.1:8080", "control-plane base URL, e.g. http://ctrl:8080")
-	flag.StringVar(&code, "code", "", "connect: code '<nameplate>-<word>-<word>'")
-	flag.StringVar(&mode, "mode", "host", "host|connect")
+	flag.StringVar(&code, "code", "", "join: code '<nameplate>-<word>-<word>'")
+	flag.StringVar(&codeShort, "c", "", "alias of -code")
+	flag.StringVar(&mode, "mode", "", "(deprecated) host|connect; auto-detected by -code/-c or positional code")
 	flag.StringVar(&listen, "listen", "", "optional listen multiaddrs (comma-separated)")
 	flag.StringVar(&outDir, "outdir", ".", "directory to save incoming files")
 	flag.StringVar(&dlDir, "download-dir", "", "download directory (alias of -outdir)")
@@ -1667,11 +1790,30 @@ func main() {
 	flag.Parse()
 	_ = jsonOut
 
+	// 支持通过位置参数传递代码
+	var codeRe = regexp.MustCompile(`^\d{3}-[a-z]+-[a-z]+$`)
+	if code == "" && codeShort != "" {
+		code = codeShort
+	}
+	if code == "" && flag.NArg() == 1 && codeRe.MatchString(flag.Arg(0)) {
+		code = flag.Arg(0)
+	}
+
+	// 根据是否提供了 `-code` 参数来推断模式 (host 或 connect)
+	inferred := "host"
+	if code != "" {
+		inferred = "connect"
+	}
+	if mode == "" {
+		mode = inferred
+	} else if mode != inferred {
+		fmt.Println("warn: -mode is deprecated and conflicts with inferred mode; proceeding with -mode =", mode)
+	}
+
 	if dlDir != "" {
 		outDir = dlDir
 	}
 
-	// 自动“本机调试模式”判定
 	isLocalDev := func(u string) bool {
 		pu, err := url.Parse(u)
 		if err != nil {
@@ -1681,7 +1823,7 @@ func main() {
 		return h == "127.0.0.1" || h == "localhost"
 	}(controlURL)
 
-	// listen 补默认 loopback
+	// 如果是本地开发环境，默认监听环回地址
 	var extraListen []ma.Multiaddr
 	if listen == "" && isLocalDev {
 		def := []string{
@@ -1711,28 +1853,9 @@ func main() {
 	var nameplate string
 	var passphrase string
 
-	switch mode {
-	case "host":
-		var alloc allocateResponse
-		if err := httpPostJSON(ctx, controlURL, "/v1/allocate", nil, &alloc); err != nil {
-			log.Fatalf("allocate: %v", err)
-		}
-		nameplate = alloc.Nameplate
-		topic = alloc.Topic
-		var err error
-		rendezvousAIs, err = parseP2pAddrInfos(alloc.Rendezvous.Addrs)
-		if err != nil {
-			log.Fatalf("rendezvous addrs: %v", err)
-		}
-		relayAIs, _ = parseP2pAddrInfos(alloc.Relay.Addrs)
-
-		ws := effWords()
-		w1, w2 := randWord(ws), randWord(ws)
-		passphrase = fmt.Sprintf("%s-%s", w1, w2)
-		fullCode := fmt.Sprintf("%s-%s", nameplate, passphrase)
-		fmt.Printf("hosting at code=%q (expires: %s)\n", fullCode, alloc.ExpiresAt.UTC().Format(time.RFC3339))
-
-	case "connect":
+	// 根据模式与控制服务器交互。
+	if mode == "connect" {
+		// 连接模式：使用给定的代码向服务器声明
 		if code == "" {
 			log.Fatalf("please pass -code '<nameplate>-<word>-<word>'")
 		}
@@ -1757,11 +1880,12 @@ func main() {
 		}
 		relayAIs, _ = parseP2pAddrInfos(clm.Relay.Addrs)
 
-	default:
+	} else if mode != "host" {
+		// 如果模式不是 "connect" 也不是 "host"，则为未知模式。
 		log.Fatalf("unknown -mode %q", mode)
 	}
 
-	// —— 分离“候选中继”与“已预约中继” —— //
+	// 初始化 libp2p 主机
 	var autoRelayCandidate *peer.AddrInfo
 	if len(relayAIs) > 0 {
 		autoRelayCandidate = &relayAIs[0]
@@ -1774,12 +1898,20 @@ func main() {
 	}
 	defer h.Close()
 
-	// 连接 rendezvous
-	if _, err := connectAny(ctx, h, rendezvousAIs); err != nil {
-		log.Fatalf("connect rendezvous: %v", err)
+	// 注意：在 host 模式下，rendezvousAIs 在这里是空的，这没关系。
+	// 它会在下面的主循环中被正确填充，然后才会去连接 rendezvous 服务器。
+	// 而 connect 模式下，此时 rendezvousAIs 已经有值了。
+	if mode == "connect" {
+		// 连接到汇合点服务器
+		if len(rendezvousAIs) == 0 {
+			log.Fatalf("no rendezvous addrs found for connect mode")
+		}
+		if _, err := connectAny(ctx, h, rendezvousAIs); err != nil {
+			log.Fatalf("connect rendezvous: %v", err)
+		}
 	}
 
-	// 预约任意可用 relay；仅当成功后才用于拼接 /p2p-circuit 自身地址
+	// 尝试预订一个中继槽位
 	if len(relayAIs) > 0 {
 		if r := reserveAnyRelay(ctx, h, relayAIs); r == nil {
 			if verbose {
@@ -1795,55 +1927,113 @@ func main() {
 		}
 	}
 
-	// —— 按场景选择发布策略 —— //
+	// 配置汇合点客户端
 	addrFac := rendezvousAddrsFactory(h, reservedRelay, isLocalDev)
 
-	rzvPeer := rendezvousAIs[0].ID
-	rp := rzv.NewRendezvousPoint(
-		h, rzvPeer,
-		rzv.ClientWithAddrsFactory(addrFac),
-	)
-	rzvc := rzv.NewRendezvousClientWithPoint(rp)
+	// 延迟 rendezvous client 的初始化，直到我们确定有了 rendezvous 服务器的地址
+	var rzvc rzv.RendezvousClient
 
-	// 调试输出：预览将发布给 rendezvous 的地址列表（仅 verbose）
 	if verbose {
 		pub := addrFac(h.Addrs())
 		if len(pub) > 0 {
 			fmt.Println("announce addrs:")
 			for _, a := range pub {
-				fmt.Println("  ", a.String())
+				fmt.Println("   ", a.String())
 			}
 		}
 	}
 
+	// 根据模式执行不同的逻辑
 	switch mode {
 	case "host":
-		if _, err := rzvc.Register(ctx, topic, 120); err != nil {
-			log.Fatalf("rendezvous register: %v", err)
-		}
-		inbound := make(chan network.Stream, 1)
-		var acceptOnce sync.Once
-		h.SetStreamHandler(protoChat, func(s network.Stream) {
-			ok := false
-			acceptOnce.Do(func() {
-				ok = true
-				h.RemoveStreamHandler(protoChat)
-				go func() { inbound <- s }()
-			})
-			if !ok {
-				_ = s.Reset()
+		// 启动一个无限循环，用于代码的自动轮换
+		for {
+			// 1. 主机模式：向服务器申请一个新的代码
+			var alloc allocateResponse
+			if err := httpPostJSON(ctx, controlURL, "/v1/allocate", nil, &alloc); err != nil {
+				// 如果在启动时分配失败，则致命退出。如果在循环中失败，可以选择重试或退出。
+				log.Fatalf("allocate: %v", err)
 			}
-		})
-		fmt.Println("waiting for peer…")
-		var s network.Stream
-		select {
-		case s = <-inbound:
-		case <-ctx.Done():
-			return
+			nameplate = alloc.Nameplate
+			topic = alloc.Topic
+			// 从服务器获取 rendezvous 和 relay 信息
+			rendezvousAIs, err = parseP2pAddrInfos(alloc.Rendezvous.Addrs)
+			if err != nil {
+				log.Fatalf("rendezvous addrs: %v", err)
+			}
+
+			// 第一次循环时，连接到 rendezvous 服务器
+			if rzvc == nil {
+				if _, err := connectAny(ctx, h, rendezvousAIs); err != nil {
+					log.Fatalf("connect rendezvous: %v", err)
+				}
+				// 初始化客户端
+				rzvPeer := rendezvousAIs[0].ID
+				rp := rzv.NewRendezvousPoint(h, rzvPeer, rzv.ClientWithAddrsFactory(addrFac))
+				rzvc = rzv.NewRendezvousClientWithPoint(rp)
+			}
+
+			ws := effWords()
+			w1, w2 := randWord(ws), randWord(ws)
+			passphrase = fmt.Sprintf("%s-%s", w1, w2)
+			fullCode := fmt.Sprintf("%s-%s", nameplate, passphrase)
+
+			// 2. 打印新的代码信息，使用本地时区显示过期时间
+			fmt.Printf("Starting session…\nYour code: %s\nAsk peer to run: wormhole -c %s\n(Expires: %s)\n",
+				fullCode, fullCode, ts())
+
+			// 3. 使用新主题在汇合点注册自己
+			if _, err := rzvc.Register(ctx, topic, 120); err != nil {
+				log.Printf("warn: rendezvous register failed: %v. will retry on next code rotation.", err)
+				// 等待一小段时间后重试循环，避免快速失败导致API滥用
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			// 4. 设置流处理器，准备接受连接
+			inbound := make(chan network.Stream, 1)
+			var acceptOnce sync.Once
+			h.SetStreamHandler(protoChat, func(s network.Stream) {
+				ok := false
+				acceptOnce.Do(func() { // 只接受第一个连接
+					ok = true
+					h.RemoveStreamHandler(protoChat)
+					go func() { inbound <- s }()
+				})
+				if !ok {
+					_ = s.Reset()
+				}
+			})
+			fmt.Println("waiting for peer…")
+
+			// 5. 使用 select 等待连接、代码过期或程序中断
+			var s network.Stream
+			select {
+			case s = <-inbound:
+				// 成功接收连接，运行会话然后退出程序
+				runAccepted(ctx, h, s, controlURL, outDir, verify, nameplate, passphrase)
+				return // 会话结束，程序退出
+
+			case <-time.After(time.Until(alloc.ExpiresAt)):
+				// 等待直到代码过期。time.Until会计算出距离过期时间的时长。
+				fmt.Println("\ncode expired, allocating a new one…")
+				h.RemoveStreamHandler(protoChat) // 清理旧的处理器
+				continue                         // 继续循环，获取新代码
+
+			case <-ctx.Done():
+				// 用户按下了 Ctrl+C
+				fmt.Println("\nshutting down.")
+				return // 退出程序
+			}
 		}
-		runAccepted(ctx, h, s, controlURL, outDir, verify, nameplate, passphrase)
 
 	case "connect":
+		// 在 connect 模式下，现在才初始化 rendezvous client
+		rzvPeer := rendezvousAIs[0].ID
+		rp := rzv.NewRendezvousPoint(h, rzvPeer, rzv.ClientWithAddrsFactory(addrFac))
+		rzvc = rzv.NewRendezvousClientWithPoint(rp)
+
+		// 连接模式：通过汇合点发现主机并尝试连接
 		relayFirst := isLocalDev
 		s, err := tryOpenChat(ctx, h, rzvc, topic, relayAIs, 60*time.Second, relayFirst)
 		if err != nil {
