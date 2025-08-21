@@ -120,6 +120,16 @@ func (c *controlDB) delete(nameplate string) error {
 	return err
 }
 
+// 原子失败作废：若尚未作废，则 fail_count++；无论如何都置 consumed=1
+func (c *controlDB) failAndConsume(nameplate string) error {
+	_, err := c.db.Exec(`
+		UPDATE nameplates
+		   SET fail_count = fail_count + CASE WHEN consumed=0 THEN 1 ELSE 0 END,
+		       consumed   = 1
+		 WHERE nameplate = ?`, nameplate)
+	return err
+}
+
 // claim 对“相同侧重复认领”与“无效 side”进行 fail_count++，
 // 对过期的 nameplate 直接从数据库删除并返回 failed。
 func (c *controlDB) claim(nameplate, side string, now time.Time, ip string) (plateStatus, *nameplateRow, error) {
@@ -217,6 +227,10 @@ type claimResponse struct {
 }
 
 type consumeRequest struct {
+	Nameplate string `json:"nameplate"`
+}
+
+type failRequest struct {
 	Nameplate string `json:"nameplate"`
 }
 
@@ -547,7 +561,8 @@ func main() {
 		writeJSON(w, http.StatusOK, resp)
 	}))
 
-	mux.HandleFunc("/v1/consume", func(w http.ResponseWriter, r *http.Request) {
+	// 成功握手：标记 consumed（一次性）
+	mux.HandleFunc("/v1/consume", withRateLimit(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -566,7 +581,30 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
-	})
+	}))
+
+	// 失败握手：fail_count++（仅在未作废时加一）且 consumed=1 作废
+	mux.HandleFunc("/v1/fail", withRateLimit(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var req failRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if req.Nameplate == "" {
+			http.Error(w, "nameplate required", http.StatusBadRequest)
+			return
+		}
+		if err := ctrlDB.failAndConsume(req.Nameplate); err != nil {
+			http.Error(w, "fail-and-consume failed", http.StatusInternalServerError)
+			return
+		}
+		// 幂等：即便已作废也返回 ok=true，方便客户端重试/清理
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
+	}))
 
 	srv := &http.Server{
 		Addr:              ctrlListen,

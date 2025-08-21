@@ -92,6 +92,9 @@ type claimResponse struct {
 type consumeRequest struct {
 	Nameplate string `json:"nameplate"`
 }
+type failRequest struct {
+	Nameplate string `json:"nameplate"`
+}
 
 // ---------- 小工具 ----------
 var verbose bool // 全局：是否打印详尽日志
@@ -892,7 +895,21 @@ func askYesNoWithReadline(ui *uiConsole, question string, timeout time.Duration,
 	}
 }
 
-func runAccepted(ctx context.Context, h host.Host, s network.Stream, outDir string, verify bool, nameplate, passphrase string) {
+// —— 新增：中心上报的便捷函数 —— //
+func postConsumeAsync(controlURL, nameplate string) {
+	go func() {
+		_ = httpPostJSON(context.Background(), controlURL, "/v1/consume",
+			consumeRequest{Nameplate: nameplate}, &struct{}{})
+	}()
+}
+func postFailAsync(controlURL, nameplate string) {
+	go func() {
+		_ = httpPostJSON(context.Background(), controlURL, "/v1/fail",
+			failRequest{Nameplate: nameplate}, &struct{}{})
+	}()
+}
+
+func runAccepted(ctx context.Context, h host.Host, s network.Stream, controlURL, outDir string, verify bool, nameplate, passphrase string) {
 	// 如果（真正的）SIGINT 到达，立刻打断读并半关写，避免读循环阻塞
 	go func() {
 		<-ctx.Done()
@@ -909,6 +926,14 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, outDir stri
 		return
 	}
 	// FIX: 不使用 defer ui.Close()，避免 Close() 阻塞退出；改为需要时异步关闭
+
+	handshakeSuccess := false
+	defer func() {
+		// 统一的握手失败回收：若未成功，则 fail+consume
+		if !handshakeSuccess {
+			postFailAsync(controlURL, nameplate)
+		}
+	}()
 
 	// —— 握手：HELLO -> (PAKE+confirm) -> 人工确认 ——
 	if s.Stat().Direction == network.DirInbound {
@@ -954,6 +979,8 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, outDir stri
 		}
 		switch strings.TrimSpace(peerAck) {
 		case chatAccept:
+			handshakeSuccess = true
+			postConsumeAsync(controlURL, nameplate)
 		case chatReject:
 			_ = s.Close()
 			go ui.Close()
@@ -1011,6 +1038,8 @@ func runAccepted(ctx context.Context, h host.Host, s network.Stream, outDir stri
 				ui.logln("handshake failed: write accept error")
 				return
 			}
+			handshakeSuccess = true
+			postConsumeAsync(controlURL, nameplate)
 		case chatReject:
 			ui.logln("handshake failed: peer rejected the verification")
 			_ = s.Close()
@@ -1668,10 +1697,7 @@ func main() {
 		case <-ctx.Done():
 			return
 		}
-		go func() {
-			_ = httpPostJSON(context.Background(), controlURL, "/v1/consume", consumeRequest{Nameplate: nameplate}, &struct{}{})
-		}()
-		runAccepted(ctx, h, s, outDir, verify, nameplate, passphrase)
+		runAccepted(ctx, h, s, controlURL, outDir, verify, nameplate, passphrase)
 
 	case "connect":
 		relayFirst := isLocalDev
@@ -1679,6 +1705,6 @@ func main() {
 		if err != nil {
 			log.Fatalf("open chat: %v", err)
 		}
-		runAccepted(ctx, h, s, outDir, verify, nameplate, passphrase)
+		runAccepted(ctx, h, s, controlURL, outDir, verify, nameplate, passphrase)
 	}
 }
