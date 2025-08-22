@@ -8,6 +8,7 @@ require (
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/vbauerster/mpb/v8 v8.10.2
 	github.com/waku-org/go-libp2p-rendezvous v0.0.0-20240110193335-a67d1cc760a0
+	github.com/zeebo/xxh3 v1.0.2
 	golang.org/x/crypto v0.41.0
 	modernc.org/sqlite v1.38.2
 	salsa.debian.org/vasudev/gospake2 v0.0.0-20210510093858-d91629950ad1
@@ -96,7 +97,6 @@ require (
 	github.com/rogpeppe/go-internal v1.13.1 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	github.com/zeebo/xxh3 v1.0.2 // indirect
 	go.uber.org/dig v1.19.0 // indirect
 	go.uber.org/fx v1.24.0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
