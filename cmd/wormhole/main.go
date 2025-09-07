@@ -1777,7 +1777,7 @@ func main() {
 	var jsonOut bool
 	var dlDir string
 
-	flag.StringVar(&controlURL, "control", "http://127.0.0.1:8080", "control-plane base URL, e.g. http://ctrl:8080")
+	flag.StringVar(&controlURL, "control", "https://wormhole.pianlab.team", "control-plane base URL, e.g. http://ctrl:8080")
 	flag.StringVar(&code, "code", "", "join: code '<nameplate>-<word>-<word>'")
 	flag.StringVar(&codeShort, "c", "", "alias of -code")
 	flag.StringVar(&mode, "mode", "", "(deprecated) host|connect; auto-detected by -code/-c or positional code")
@@ -1897,6 +1897,9 @@ func main() {
 		log.Fatal(err)
 	}
 	defer h.Close()
+
+	// 打印自己的 PeerID
+	fmt.Printf("Your PeerID: %s\n", h.ID().String())
 
 	// 注意：在 host 模式下，rendezvousAIs 在这里是空的，这没关系。
 	// 它会在下面的主循环中被正确填充，然后才会去连接 rendezvous 服务器。
