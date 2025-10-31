@@ -79,13 +79,27 @@ func ClassifyPath(c network.Conn) PathInfo {
 }
 
 // ParseAddrInfos 解析地址字符串列表为 peer.AddrInfo
+// 会自动合并同一个 peer 的多个地址，并处理中继地址
 func ParseAddrInfos(addrs []string) ([]peer.AddrInfo, error) {
-	var out []peer.AddrInfo
+	// 使用 map 来合并同一 peer 的多个地址
+	peerMap := make(map[peer.ID]*peer.AddrInfo)
+
 	for _, s := range addrs {
 		if strings.HasPrefix(s, "dnsaddr://") {
 			// 跳过 dnsaddr，这里简化处理
 			continue
 		}
+
+		// 处理包含 /p2p-circuit 的中继地址
+		// 对于 /p2p/A/p2p-circuit/p2p/B 这样的地址，我们提取最终目标 B
+		if strings.Contains(s, "/p2p-circuit/p2p/") {
+			// 提取 /p2p-circuit 之后的部分
+			parts := strings.Split(s, "/p2p-circuit")
+			if len(parts) >= 2 {
+				s = parts[len(parts)-1] // 取最后一部分
+			}
+		}
+
 		maddr, err := ma.NewMultiaddr(s)
 		if err != nil {
 			continue
@@ -94,10 +108,24 @@ func ParseAddrInfos(addrs []string) ([]peer.AddrInfo, error) {
 		if err != nil {
 			continue
 		}
-		out = append(out, *ai)
+
+		// 如果这个 peer 已经存在，合并地址
+		if existing, ok := peerMap[ai.ID]; ok {
+			existing.Addrs = append(existing.Addrs, ai.Addrs...)
+		} else {
+			peerMap[ai.ID] = ai
+		}
 	}
-	if len(out) == 0 {
+
+	if len(peerMap) == 0 {
 		return nil, fmt.Errorf("no valid addresses")
 	}
+
+	// 转换 map 为 slice
+	var out []peer.AddrInfo
+	for _, ai := range peerMap {
+		out = append(out, *ai)
+	}
+
 	return out, nil
 }
