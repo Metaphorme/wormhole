@@ -353,9 +353,11 @@ func TestXfer_Dir_RoundTrip(t *testing.T) {
 	}
 
 	// 校验目标存在并内容一致
+	// 注意：目录传输会在 outDir 下创建一个与源目录同名的子目录
+	dirName := filepath.Base(srcRoot)
 	checkSame := func(rel string) {
 		src := filepath.Join(srcRoot, rel)
-		dst := filepath.Join(outDir, rel)
+		dst := filepath.Join(outDir, dirName, rel)
 		s, _ := os.ReadFile(src)
 		d, err := os.ReadFile(dst)
 		if err != nil {

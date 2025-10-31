@@ -579,6 +579,12 @@ func handleIncomingXfer(_ context.Context, _ host.Host, xs network.Stream, outDi
 	hasher := xxh3.NewSeed(seed)
 	lastTick := time.Now()
 
+	// 对于目录传输，在 outDir 下创建一个与原目录同名的子目录
+	baseDir := outDir
+	if off.Kind == "dir" {
+		baseDir = filepath.Join(outDir, off.Name)
+	}
+
 	for {
 		typ, payload, err = readFrame(xs)
 		if err != nil {
@@ -593,7 +599,7 @@ func handleIncomingXfer(_ context.Context, _ host.Host, xs network.Stream, outDi
 				Hash string `json:"hash"`
 			}
 			_ = json.Unmarshal(payload, &hdr)
-			dstPath = filepath.Join(outDir, hdr.Name)
+			dstPath = filepath.Join(baseDir, hdr.Name)
 			_ = os.MkdirAll(filepath.Dir(dstPath), 0o755)
 			fw, err = os.Create(dstPath)
 			if err != nil {
