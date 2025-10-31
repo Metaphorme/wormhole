@@ -19,6 +19,9 @@ import (
 	tcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	rzv "github.com/waku-org/go-libp2p-rendezvous"
 	rzvsqlite "github.com/waku-org/go-libp2p-rendezvous/db/sqlite"
+
+	"github.com/Metaphorme/wormhole/pkg/models"
+	"github.com/Metaphorme/wormhole/pkg/server"
 )
 
 // ----------------- 测试工具 -----------------
@@ -50,7 +53,7 @@ func startWormholeServerForTest(t *testing.T, cfg serverConfig) *testServer {
 	identityPath := filepath.Join(tmp, "server.key")
 
 	// 加载/创建持久身份
-	priv, err := loadOrCreateIdentity(identityPath)
+	priv, err := server.LoadOrCreateIdentity(identityPath)
 	if err != nil {
 		t.Fatalf("loadOrCreateIdentity: %v", err)
 	}
@@ -75,21 +78,21 @@ func startWormholeServerForTest(t *testing.T, cfg serverConfig) *testServer {
 	}
 	_ = rzv.NewRendezvousService(h, rdb)
 
-	ctrlDB, err := openControlDB(dbPath)
+	ctrlDB, err := server.OpenControlDB(dbPath)
 	if err != nil {
 		t.Fatalf("open control db: %v", err)
 	}
 
-	advertised := advertisedAddrsWithP2P(h, cfg.publicAddrs)
+	advertised := server.AdvertisedAddrsWithP2P(h, cfg.publicAddrs)
 
 	// HTTP mux (main.go 处理程序的副本，闭包捕获了局部变量)
 	mux := http.NewServeMux()
-	ipRate := newIPLimiter(cfg.reqWindow, cfg.maxReqs, cfg.failWindow, cfg.maxFails)
+	ipRate := server.NewIPLimiter(cfg.reqWindow, cfg.maxReqs, cfg.failWindow, cfg.maxFails)
 
 	withRateLimit := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			ip := clientIP(r)
-			if ok, wait := ipRate.allow(ip, time.Now()); !ok {
+			ip := server.ClientIP(r)
+			if ok, wait := ipRate.Allow(ip, time.Now()); !ok {
 				w.Header().Set("Retry-After", strings.TrimSuffix((wait).Round(time.Second).String(), "0s"))
 				http.Error(w, "too many requests", http.StatusTooManyRequests)
 				return
@@ -103,23 +106,23 @@ func startWormholeServerForTest(t *testing.T, cfg serverConfig) *testServer {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		ip := clientIP(r)
-		np, exp, err := allocateNameplate(ctrlDB, cfg.digits, cfg.ttl, time.Now(), ip)
+		ip := server.ClientIP(r)
+		np, exp, err := server.AllocateNameplate(ctrlDB, cfg.digits, cfg.ttl, time.Now(), ip)
 		if err != nil {
 			http.Error(w, "allocate failed", http.StatusInternalServerError)
 			return
 		}
-		resp := allocateResponse{
+		resp := models.AllocateResponse{
 			Nameplate: np,
 			ExpiresAt: exp,
-			ConnectionInfo: ConnectionInfo{
-				Rendezvous: addrBundle{Namespace: cfg.namespace, Addrs: advertised},
-				Relay:      addrBundle{Namespace: "circuit-relay-v2", Addrs: relayAddrsWithCircuit(advertised)},
-				Bootstrap:  splitCSV(cfg.bootstrapCSV),
+			ConnectionInfo: models.ConnectionInfo{
+				Rendezvous: models.AddrBundle{Namespace: cfg.namespace, Addrs: advertised},
+				Relay:      models.AddrBundle{Namespace: "circuit-relay-v2", Addrs: server.RelayAddrsWithCircuit(advertised)},
+				Bootstrap:  server.SplitCSV(cfg.bootstrapCSV),
 				Topic:      "/wormhole/" + np,
 			},
 		}
-		writeJSON(w, http.StatusOK, resp)
+		server.WriteJSON(w, http.StatusOK, resp)
 	}))
 
 	mux.HandleFunc("/v1/claim", withRateLimit(func(w http.ResponseWriter, r *http.Request) {
@@ -127,14 +130,14 @@ func startWormholeServerForTest(t *testing.T, cfg serverConfig) *testServer {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		var req claimRequest
+		var req models.ClaimRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Nameplate == "" || req.Side == "" {
-			ipRate.recordFail(clientIP(r), time.Now())
+			ipRate.RecordFail(server.ClientIP(r), time.Now())
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		ip := clientIP(r)
-		st, row, err := ctrlDB.claim(req.Nameplate, req.Side, time.Now(), ip)
+		ip := server.ClientIP(r)
+		st, row, err := ctrlDB.Claim(req.Nameplate, req.Side, time.Now(), ip)
 		if err != nil {
 			http.Error(w, "claim failed", http.StatusInternalServerError)
 			return
@@ -145,20 +148,20 @@ func startWormholeServerForTest(t *testing.T, cfg serverConfig) *testServer {
 		} else {
 			exp = time.Now().UTC()
 		}
-		if st == statusFailed {
-			ipRate.recordFail(ip, time.Now())
+		if st == server.StatusFailed {
+			ipRate.RecordFail(ip, time.Now())
 		}
-		resp := claimResponse{
-			Status:    st,
+		resp := models.ClaimResponse{
+			Status:    string(st),
 			ExpiresAt: exp,
-			ConnectionInfo: ConnectionInfo{
-				Rendezvous: addrBundle{Namespace: cfg.namespace, Addrs: advertised},
-				Relay:      addrBundle{Namespace: "circuit-relay-v2", Addrs: relayAddrsWithCircuit(advertised)},
-				Bootstrap:  splitCSV(cfg.bootstrapCSV),
+			ConnectionInfo: models.ConnectionInfo{
+				Rendezvous: models.AddrBundle{Namespace: cfg.namespace, Addrs: advertised},
+				Relay:      models.AddrBundle{Namespace: "circuit-relay-v2", Addrs: server.RelayAddrsWithCircuit(advertised)},
+				Bootstrap:  server.SplitCSV(cfg.bootstrapCSV),
 				Topic:      "/wormhole/" + req.Nameplate,
 			},
 		}
-		writeJSON(w, http.StatusOK, resp)
+		server.WriteJSON(w, http.StatusOK, resp)
 	}))
 
 	mux.HandleFunc("/v1/consume", withRateLimit(func(w http.ResponseWriter, r *http.Request) {
@@ -166,16 +169,16 @@ func startWormholeServerForTest(t *testing.T, cfg serverConfig) *testServer {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		var req consumeRequest
+		var req models.ConsumeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Nameplate == "" {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		if err := ctrlDB.consume(req.Nameplate); err != nil {
+		if err := ctrlDB.Consume(req.Nameplate); err != nil {
 			http.Error(w, "consume failed", http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
+		server.WriteJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 	}))
 
 	mux.HandleFunc("/v1/fail", withRateLimit(func(w http.ResponseWriter, r *http.Request) {
@@ -183,23 +186,23 @@ func startWormholeServerForTest(t *testing.T, cfg serverConfig) *testServer {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		var req failRequest
+		var req models.FailRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Nameplate == "" {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		if err := ctrlDB.failAndConsume(req.Nameplate); err != nil {
+		if err := ctrlDB.FailAndConsume(req.Nameplate); err != nil {
 			http.Error(w, "fail-and-consume failed", http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
+		server.WriteJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 	}))
 
-	ts := httptest.NewServer(logRequests(mux))
+	ts := httptest.NewServer(server.LogRequests(mux))
 
 	t.Cleanup(func() {
 		ts.Close()
-		ctrlDB.close()
+		ctrlDB.Close()
 		_ = rdb.Close()
 		_ = h.Close()
 	})
@@ -260,7 +263,7 @@ func TestAllocateClaimConsumeFlow(t *testing.T) {
 	})
 
 	// 1) 分配
-	alloc, _ := postJSON[allocateResponse](t, s.baseURL, "/v1/allocate", map[string]any{}, nil)
+	alloc, _ := postJSON[models.AllocateResponse](t, s.baseURL, "/v1/allocate", map[string]any{}, nil)
 	if len(alloc.Nameplate) != 3 {
 		t.Fatalf("unexpected nameplate length: %q", alloc.Nameplate)
 	}
@@ -278,26 +281,26 @@ func TestAllocateClaimConsumeFlow(t *testing.T) {
 	}
 
 	// 2) 主机端声明 -> 等待中
-	cl1, _ := postJSON[claimResponse](t, s.baseURL, "/v1/claim", claimRequest{
+	cl1, _ := postJSON[models.ClaimResponse](t, s.baseURL, "/v1/claim", models.ClaimRequest{
 		Nameplate: alloc.Nameplate,
 		Side:      "host",
 	}, nil)
-	if cl1.Status != statusWaiting {
+	if cl1.Status != string(server.StatusWaiting) {
 		t.Fatalf("expect waiting, got %s", cl1.Status)
 	}
 
 	// 3) 连接端声明 -> 已配对
-	cl2, _ := postJSON[claimResponse](t, s.baseURL, "/v1/claim", claimRequest{
+	cl2, _ := postJSON[models.ClaimResponse](t, s.baseURL, "/v1/claim", models.ClaimRequest{
 		Nameplate: alloc.Nameplate,
 		Side:      "connect",
 	}, nil)
-	if cl2.Status != statusPaired {
+	if cl2.Status != string(server.StatusPaired) {
 		t.Fatalf("expect paired, got %s", cl2.Status)
 	}
 
 	// 4) 消费 -> 成功
 	var ok map[string]string
-	ok, _ = postJSON[map[string]string](t, s.baseURL, "/v1/consume", consumeRequest{
+	ok, _ = postJSON[map[string]string](t, s.baseURL, "/v1/consume", models.ConsumeRequest{
 		Nameplate: alloc.Nameplate,
 	}, nil)
 	if ok["ok"] != "true" {
@@ -305,11 +308,11 @@ func TestAllocateClaimConsumeFlow(t *testing.T) {
 	}
 
 	// 5) 再次声明 -> 失败
-	cl3, _ := postJSON[claimResponse](t, s.baseURL, "/v1/claim", claimRequest{
+	cl3, _ := postJSON[models.ClaimResponse](t, s.baseURL, "/v1/claim", models.ClaimRequest{
 		Nameplate: alloc.Nameplate,
 		Side:      "host",
 	}, nil)
-	if cl3.Status != statusFailed {
+	if cl3.Status != string(server.StatusFailed) {
 		t.Fatalf("expect failed after consumed, got %s", cl3.Status)
 	}
 }
@@ -324,15 +327,15 @@ func TestFailEndpointIsIdempotent(t *testing.T) {
 		failWindow: 1 * time.Minute,
 		maxFails:   100,
 	})
-	alloc, _ := postJSON[allocateResponse](t, s.baseURL, "/v1/allocate", map[string]any{}, nil)
+	alloc, _ := postJSON[models.AllocateResponse](t, s.baseURL, "/v1/allocate", map[string]any{}, nil)
 
 	// 第一次失败
-	first, _ := postJSON[map[string]string](t, s.baseURL, "/v1/fail", failRequest{Nameplate: alloc.Nameplate}, nil)
+	first, _ := postJSON[map[string]string](t, s.baseURL, "/v1/fail", models.FailRequest{Nameplate: alloc.Nameplate}, nil)
 	if first["ok"] != "true" {
 		t.Fatalf("first fail not ok: %+v", first)
 	}
 	// 第二次失败 (幂等)
-	second, _ := postJSON[map[string]string](t, s.baseURL, "/v1/fail", failRequest{Nameplate: alloc.Nameplate}, nil)
+	second, _ := postJSON[map[string]string](t, s.baseURL, "/v1/fail", models.FailRequest{Nameplate: alloc.Nameplate}, nil)
 	if second["ok"] != "true" {
 		t.Fatalf("second fail not ok: %+v", second)
 	}
@@ -352,13 +355,13 @@ func TestRateLimitHits429(t *testing.T) {
 
 	// 3 次快速成功的调用
 	for i := 0; i < 3; i++ {
-		_, resp := postJSON[allocateResponse](t, s.baseURL, "/v1/allocate", map[string]any{}, hdr)
+		_, resp := postJSON[models.AllocateResponse](t, s.baseURL, "/v1/allocate", map[string]any{}, hdr)
 		if resp.StatusCode != 200 {
 			t.Fatalf("unexpected status on warmup %d: %d", i, resp.StatusCode)
 		}
 	}
 	// 第 4 次应该收到 429
-	_, resp := postJSON[allocateResponse](t, s.baseURL, "/v1/allocate", map[string]any{}, hdr)
+	_, resp := postJSON[models.AllocateResponse](t, s.baseURL, "/v1/allocate", map[string]any{}, hdr)
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("expect 429, got %d", resp.StatusCode)
 	}

@@ -2,4 +2,6 @@ wormhole
 wormhole-server
 *.key
 *.db
+*.db-shm
+*.db-wal
 test_wormhole/
